@@ -55,6 +55,7 @@ const HIT_FLASH = 0.12;           // white flash when hit
 const SKEL_SIZE = PLAYER_SIZE;    // same body as the player
 const SKELETON_EASY = {
   hp: 2,                  // sword hits to kill
+  damage: 1,              // player HP lost per hit
   speed: 110,             // chase speed, px/s (player is 180)
   wanderSpeed: 40,        // idle wandering speed
   aggroRange: 220,        // notices the player within this distance (center to center)
@@ -68,8 +69,17 @@ const SKELETON_EASY = {
   swingArc: Math.PI / 2,  // 90 degrees (player: 120)
   swingReach: 32,         // px from center (player: 40)
 };
-// Placeholder: identical to easy until max-hard is designed.
-const SKELETON_HARD = Object.assign({}, SKELETON_EASY);
+// Max hard. hp and damage are deliberately the same as easy for now: they
+// can't be placed meaningfully until there's a maze and other enemy types.
+const SKELETON_HARD = Object.assign({}, SKELETON_EASY, {
+  speed: 200,             // faster than the player
+  aggroRange: 320,
+  leashRange: 550,
+  attackRange: 49,        // matches its longer reach
+  windup: 0.08,           // barely any warning
+  swingArc: Math.PI * 3 / 4, // 135 degrees
+  swingReach: 43,
+});
 
 function lerp(a, b, t) { return a + (b - a) * t; }
 
@@ -444,7 +454,7 @@ function spawnWave(game, count) {
       if (boxHitsWall(room, x, y, SKEL_SIZE)) continue;
       if (distBetween(probe, p) < SPAWN_MIN_DIST) continue;
       if (game.skeletons.some((s) => distBetween(probe, s) < SKEL_SIZE * 2)) continue;
-      game.skeletons.push(makeSkeleton(game.nextId++, x, y, rng));
+      game.skeletons.push(makeSkeleton(game.nextId++, x, y, rng, game.difficulty));
       break;
     }
   }
@@ -456,7 +466,7 @@ function spawnWave(game, count) {
 function hurtPlayer(game, attacker) {
   const p = game.player;
   if (p.iframes > 0 || game.over) return;
-  p.hp -= 1;
+  p.hp -= attacker.stats ? Math.round(attacker.stats.damage) : 1;
   p.iframes = PLAYER_IFRAMES;
   p.flash = HIT_FLASH;
   knockBack(p, attacker);
@@ -505,9 +515,18 @@ function makeGame(seed, opts) {
     waveTimer: 0,
     over: false,
     waves: !(opts && opts.skeletons === false),
+    difficulty: (opts && opts.difficulty) || 0, // skeleton difficulty for new waves (testing keys 1-5)
   };
   if (game.waves) spawnWave(game, WAVE_SIZE);
   return game;
+}
+
+// Testing helper: change skeleton difficulty and replace the current wave.
+function setDifficulty(game, d) {
+  game.difficulty = d;
+  game.skeletons = [];
+  game.waveTimer = 0;
+  spawnWave(game, WAVE_SIZE);
 }
 
 function stepGame(game, input, dt) {
@@ -663,6 +682,11 @@ function drawHud(ctx, game) {
   ctx.font = "14px monospace";
   ctx.textAlign = "right";
   ctx.fillText("Skeletons slain: " + game.kills, ROOM_W * TILE - 12, 21);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#9c9486";
+  ctx.font = "12px monospace";
+  ctx.fillText("Skeleton difficulty " + game.difficulty.toFixed(2) + "  (keys 1-5: easy to hard)",
+    (ROOM_W * TILE) / 2, ROOM_H * TILE - 10);
 
   if (game.over) {
     ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
@@ -709,7 +733,13 @@ if (typeof window !== "undefined" && typeof document !== "undefined" && document
       return;
     }
     if (e.code === "KeyR" && game.over) {
-      game = makeGame((Math.random() * 1e9) | 0);
+      game = makeGame((Math.random() * 1e9) | 0, { difficulty: game.difficulty });
+      return;
+    }
+    // Testing: 1-5 set skeleton difficulty (0, 0.25, 0.5, 0.75, 1) and respawn the wave.
+    const digit = ["Digit1", "Digit2", "Digit3", "Digit4", "Digit5"].indexOf(e.code);
+    if (digit >= 0 && !game.over) {
+      setDifficulty(game, digit / 4);
       return;
     }
     const k = KEYMAP[e.code];

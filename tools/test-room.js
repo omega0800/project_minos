@@ -16,7 +16,7 @@ function loadGame() {
   vm.runInContext(
     m[1] + "\n;this.__api = { TILE, ROOM_W, ROOM_H, STEP, PLAYER_SPEED, WALL, FLOOR, makeGame, stepGame, tileAt, boxHitsWall," +
       " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER, FACING_LOCK_EXTRA, CHAIN_GRACE," +
-      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng };",
+      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED };",
     ctx
   );
   return ctx.__api;
@@ -255,6 +255,32 @@ console.log("Skeletons: difficulty profiles");
   }
   check("easy swing hits a player standing close", skeletonSwingHits(6));
   check("easy swing misses a player just past its reach", !skeletonSwingHits(E.swingReach - 8));
+
+  const H = G.SKELETON_HARD;
+  check("hard: faster than the player", H.speed > G.PLAYER_SPEED);
+  check("hard: notices from further away", H.aggroRange > E.aggroRange);
+  check("hard: much shorter wind-up", H.windup < E.windup / 3);
+  check("hard: 135 degree swing, 43 px reach", Math.abs(H.swingArc - Math.PI * 3 / 4) < 1e-9 && H.swingReach === 43);
+  check("hard: attacks only when its blade can reach", H.attackRange <= H.swingReach + 11);
+  check("hard: hp and damage same as easy (placeholders)", H.hp === E.hp && H.damage === E.damage);
+
+  function timeToFirstHit(difficulty) {
+    const g = makeFresh();
+    const sk = G.makeSkeleton(99, g.player.x + 150, g.player.y, g.rng, difficulty);
+    g.skeletons.push(sk);
+    for (let i = 0; i < Math.round(5 / G.STEP); i++) {
+      G.stepGame(g, none, G.STEP);
+      if (g.player.hp < G.PLAYER_MAX_HP) return i * G.STEP;
+    }
+    return Infinity;
+  }
+  const te = timeToFirstHit(0), th = timeToFirstHit(1);
+  check("hard skeleton lands its first hit much sooner (" + te.toFixed(2) + " s vs " + th.toFixed(2) + " s)", th < te * 0.6);
+
+  const g = G.makeGame(3);
+  G.setDifficulty(g, 1);
+  check("setDifficulty respawns the wave at that difficulty",
+    g.skeletons.length === G.WAVE_SIZE && g.skeletons.every((sk) => sk.difficulty === 1));
 }
 
 console.log("Skeletons: aggro");
