@@ -15,7 +15,8 @@ function loadGame() {
   vm.createContext(ctx);
   vm.runInContext(
     m[1] + "\n;this.__api = { TILE, ROOM_W, ROOM_H, STEP, PLAYER_SPEED, WALL, FLOOR, makeGame, stepGame, tileAt, boxHitsWall," +
-      " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER, FACING_LOCK_EXTRA, CHAIN_GRACE };",
+      " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER, FACING_LOCK_EXTRA, CHAIN_GRACE," +
+      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKEL_HP, SKEL_AGGRO_RANGE, SKEL_LEASH_RANGE, SKEL_WINDUP, SKEL_STUN, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng };",
     ctx
   );
   return ctx.__api;
@@ -188,39 +189,133 @@ console.log("Sword");
     lateP && Math.abs(Math.abs(lateP.angle) - Math.PI) < 1e-9, lateP ? "angle=" + lateP.angle.toFixed(2) : "no swing");
 }
 
-console.log("Sword vs dummies");
-{
-  const attack = Object.assign({}, none, { attack: true });
-  function besideDummy(facingX) {
-    const g = makeFresh();
-    const d = g.dummies[0];
-    // Stand just left of the dummy, a small gap between them.
-    g.player.x = d.x - g.player.size - 8;
-    g.player.y = d.y + (d.size - g.player.size) / 2;
-    g.player.facing = { x: facingX, y: 0 };
-    return g;
-  }
-  const g = besideDummy(1);
-  G.stepGame(g, attack, G.STEP);
-  run(g, none, G.SWING_TIME);
-  check("swing toward a dummy hits it", g.dummies[0].hits === 1, "hits=" + g.dummies[0].hits);
-  check("only one hit per swing", g.dummies[0].hits === 1);
-  check("far dummy untouched", g.dummies[1].hits === 0);
-
-  const away = besideDummy(-1);
-  G.stepGame(away, attack, G.STEP);
-  run(away, none, G.SWING_TIME);
-  check("swing facing away misses", away.dummies[0].hits === 0);
-
-  const twice = besideDummy(1);
-  for (let i = 0; i < 2; i++) {
-    G.stepGame(twice, attack, G.STEP);
-    run(twice, none, G.SWING_TIME + G.SWING_COOLDOWN);
-  }
-  check("two swings = two hits", twice.dummies[0].hits === 2, "hits=" + twice.dummies[0].hits);
+// ---------- Skeletons ----------
+const attackIn = Object.assign({}, none, { attack: true });
+// An empty room plus one skeleton placed dx, dy pixels from the player.
+function withSkeleton(dx, dy) {
+  const g = makeFresh();
+  const sk = G.makeSkeleton(99, g.player.x + dx, g.player.y + dy, g.rng);
+  g.skeletons.push(sk);
+  return { g, sk };
+}
+function swingAt(g, fx, fy) {
+  g.player.facing = { x: fx, y: fy };
+  G.stepGame(g, attackIn, G.STEP);
+  run(g, none, G.SWING_TIME + G.SWING_COOLDOWN);
 }
 
-function makeFresh() { return G.makeGame(); }
+console.log("Skeletons: getting hit");
+{
+  const { g, sk } = withSkeleton(34, 0);   // just right of the player, in reach
+  swingAt(g, 1, 0);
+  check("one sword hit takes 1 HP", sk.hp === G.SKEL_HP - 1, "hp=" + sk.hp);
+  check("hit skeleton is knocked back", sk.x > g.player.x + 34);
+  // Walk back into reach and finish it.
+  g.player.x = sk.x - 34; g.player.y = sk.y;
+  sk.windup = 0; sk.swing = null;
+  swingAt(g, 1, 0);
+  check("second hit kills it (2 HP)", g.skeletons.length === 0 && g.kills === 1, "left=" + g.skeletons.length);
+
+  const w = withSkeleton(34, 0);
+  w.sk.aggro = true;
+  run(w.g, none, 0.1);                       // let it start winding up
+  const wasWinding = w.sk.windup > 0;
+  swingAt(w.g, 1, 0);
+  check("hitting a winding-up skeleton cancels its attack",
+    wasWinding && w.g.player.hp === G.PLAYER_MAX_HP, "winding=" + wasWinding + " hp=" + w.g.player.hp);
+}
+
+console.log("Skeletons: aggro");
+{
+  const far = withSkeleton(G.SKEL_AGGRO_RANGE + 60, 0);
+  run(far.g, none, 2);
+  check("stays calm when the player is out of range", !far.sk.aggro);
+
+  const near = withSkeleton(G.SKEL_AGGRO_RANGE - 40, 0);
+  G.stepGame(near.g, none, G.STEP);
+  check("notices the player in range", near.sk.aggro);
+
+  near.g.player.x = 40; near.g.player.y = 40;      // teleport far away
+  near.sk.x = 900; near.sk.y = 560;
+  G.stepGame(near.g, none, G.STEP);
+  check("gives up beyond leash range", !near.sk.aggro);
+}
+
+console.log("Skeletons: attacking the player");
+{
+  const { g } = withSkeleton(150, 0);
+  let firstHit = null;
+  for (let i = 0; i < Math.round(4 / G.STEP); i++) {
+    G.stepGame(g, none, G.STEP);
+    if (firstHit === null && g.player.hp < G.PLAYER_MAX_HP) firstHit = i * G.STEP;
+  }
+  check("chases and hits a player standing still", firstHit !== null, "never hit");
+  check("first hit takes a moment (approach + wind-up)", firstHit !== null && firstHit > G.SKEL_WINDUP,
+    "t=" + (firstHit === null ? "-" : firstHit.toFixed(2)));
+
+  const one = withSkeleton(150, 0);
+  let hpAfter = null, t = 0;
+  for (; t < 4 && hpAfter === null; t += G.STEP) {
+    G.stepGame(one.g, none, G.STEP);
+    if (one.g.player.hp < G.PLAYER_MAX_HP) hpAfter = one.g.player.hp;
+  }
+  run(one.g, none, G.PLAYER_IFRAMES * 0.9);
+  check("invincible right after a hit", one.g.player.hp === hpAfter, "hp=" + one.g.player.hp);
+}
+
+console.log("Death and waves");
+{
+  const { g } = withSkeleton(60, 0);
+  run(g, none, 20);
+  check("standing still against a skeleton eventually dies", g.over && g.player.hp === 0, "hp=" + g.player.hp);
+  const px = g.player.x;
+  run(g, hold({ right: true }), 0.5);
+  check("dead player can't move", g.player.x === px);
+
+  const w = G.makeGame(7);
+  check("room starts with a full wave", w.skeletons.length === G.WAVE_SIZE, "n=" + w.skeletons.length);
+  const minD = Math.min(...w.skeletons.map((s) => Math.hypot(s.x - w.player.x, s.y - w.player.y)));
+  check("wave spawns away from the player", minD > 200, "closest=" + minD.toFixed(0));
+  w.skeletons = [];
+  run(w, none, G.WAVE_DELAY + 0.1);
+  check("a new wave appears after the room is cleared", w.skeletons.length === G.WAVE_SIZE);
+}
+
+console.log("Long fight simulation");
+{
+  // A scrappy bot: walks toward the nearest skeleton and swings when close.
+  let wallBreak = false, deaths = 0, kills = 0, steps = 0;
+  for (const seed of [1, 2, 3, 4, 5]) {
+    const g = G.makeGame(seed);
+    for (let i = 0; i < Math.round(60 / G.STEP); i++) {
+      steps++;
+      let inp = Object.assign({}, none);
+      const p = g.player;
+      let best = null, bd = Infinity;
+      for (const s of g.skeletons) {
+        const d = Math.hypot(s.x - p.x, s.y - p.y);
+        if (d < bd) { bd = d; best = s; }
+      }
+      if (best) {
+        const dx = best.x - p.x, dy = best.y - p.y;
+        if (bd > 30) {
+          inp.right = dx > 6; inp.left = dx < -6; inp.down = dy > 6; inp.up = dy < -6;
+        } else {
+          p.facing = { x: dx / bd, y: dy / bd };
+        }
+        if (bd < 40 && i % 12 === 0) inp.attack = true;
+      }
+      G.stepGame(g, inp, G.STEP);
+      for (const ent of [p, ...g.skeletons]) if (G.boxHitsWall(g.room, ent.x, ent.y, ent.size)) wallBreak = true;
+      if (g.over) { deaths++; break; }
+    }
+    kills += g.kills;
+  }
+  check("5 x 60 s of fighting: nobody ever inside a wall", !wallBreak);
+  check("the bot kills skeletons (" + kills + " kills, " + deaths + " deaths in 5 runs)", kills > 0);
+}
+
+function makeFresh() { return G.makeGame(1, { skeletons: false }); }
 
 console.log(failures === 0 ? "\nAll tests passed." : "\n" + failures + " test(s) FAILED.");
 process.exit(failures === 0 ? 0 : 1);

@@ -30,24 +30,59 @@ const STEP = 1 / 60;        // fixed simulation step, seconds
 
 const PLAYER_SIZE = 22;     // player hitbox, pixels (square)
 const PLAYER_SPEED = 180;   // pixels per second
+const PLAYER_MAX_HP = 5;
+const PLAYER_IFRAMES = 0.8; // invincible this long after taking a hit
 
-// Sword (all times in seconds, angles in radians)
+// Sword (all times in seconds, angles in radians). Player and skeletons share these.
 const SWING_TIME = 0.198;         // how long one swing lasts
 const SWING_COOLDOWN = 0.108;     // pause after a swing before the next can start
 const SWING_ARC = Math.PI * 2 / 3; // 120 degrees, centered on facing
-const SWING_REACH = 40;           // blade tip distance from player center, pixels
+const SWING_REACH = 40;           // blade tip distance from swinger's center, pixels
 const CHAIN_GRACE = 0.108;        // a press this long after a swing ends still chains (repeats its direction)
 const FACING_LOCK_EXTRA = 0.08;   // facing stays locked this long after a swing ends
 const SWING_MOVE_MULT = 0.5;      // movement speed while swinging
 const SWING_BUFFER = 0.12;        // a press this close to the end of a swing queues the next one
 
-// Practice dummies
-const DUMMY_SIZE = 24;
-const HIT_FLASH = 0.15;           // how long a dummy flashes when hit
+// Getting hit
+const KNOCKBACK_SPEED = 300;      // initial knockback speed, pixels per second
+const KNOCKBACK_TIME = 0.12;      // knockback slows to a stop over this long
+const HIT_FLASH = 0.12;           // white flash when hit
+
+// Skeletons
+const SKEL_SIZE = PLAYER_SIZE;    // same body as the player
+const SKEL_HP = 2;                // sword hits to kill
+const SKEL_SPEED = 110;           // chase speed (player is 180)
+const SKEL_WANDER_SPEED = 40;     // idle wandering speed
+const SKEL_AGGRO_RANGE = 220;     // notices the player within this distance (center to center)
+const SKEL_LEASH_RANGE = 380;     // gives up the chase beyond this distance
+const SKEL_ATTACK_RANGE = 46;     // starts an attack when this close (center to center)
+const SKEL_STOP_RANGE = 30;       // doesn't walk closer than this
+const SKEL_WINDUP = 0.35;         // telegraph before a skeleton swings
+const SKEL_COOLDOWN = 0.7;        // pause after a skeleton's swing
+const SKEL_STUN = 0.3;            // a hit skeleton can't act for this long (cancels its attack)
+
+// Room waves (for testing combat in a single room)
+const WAVE_SIZE = 3;
+const WAVE_DELAY = 2;             // seconds after a wave dies before the next appears
+const SPAWN_MIN_DIST = 250;       // skeletons spawn at least this far from the player
 
 // Tile types
 const FLOOR = 0;
 const WALL = 1;
+
+// ============================================================
+// Random numbers (seeded, so tests are repeatable)
+// ============================================================
+function makeRng(seed) {
+  let s = seed >>> 0;
+  return function () {
+    s = (s + 0x6D2B79F5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
 // ============================================================
 // Room
@@ -73,26 +108,6 @@ function isSolid(room, tx, ty) {
   return tileAt(room, tx, ty) === WALL;
 }
 
-// ============================================================
-// Player
-// ============================================================
-function makePlayer(room) {
-  // Start in the middle of the room. x, y = top-left of the hitbox.
-  return {
-    x: (room.w * TILE) / 2 - PLAYER_SIZE / 2,
-    y: (room.h * TILE) / 2 - PLAYER_SIZE / 2,
-    size: PLAYER_SIZE,
-    facing: { x: 0, y: 1 }, // last direction moved; sword swings this way
-    swing: null,            // { t, angle, hit: Set } while swinging, else null
-    cooldown: 0,            // time until another swing may start
-    facingLock: 0,          // >0 after a swing ends: facing can't turn yet
-    buffered: 0,            // >0 while a queued swing press is still fresh
-    chainAngle: null,       // set when the queued press came mid-swing or just after: next swing repeats this angle
-    lastAngle: 0,           // direction of the most recent swing
-    sinceSwing: Infinity,   // time since the last swing ended
-  };
-}
-
 // Does a box at (x, y) of the given size overlap any solid tile?
 function boxHitsWall(room, x, y, size) {
   const x0 = Math.floor(x / TILE);
@@ -107,7 +122,7 @@ function boxHitsWall(room, x, y, size) {
   return false;
 }
 
-// Move one axis at a time so the player slides along walls instead of sticking.
+// Move one axis at a time so bodies slide along walls instead of sticking.
 // If a move would enter a wall, snap flush against it.
 function moveAxis(room, ent, dx, dy) {
   if (dx !== 0) {
@@ -132,10 +147,100 @@ function moveAxis(room, ent, dx, dy) {
   }
 }
 
+function centerOf(ent) {
+  return { x: ent.x + ent.size / 2, y: ent.y + ent.size / 2 };
+}
+
+function distBetween(a, b) {
+  const ca = centerOf(a), cb = centerOf(b);
+  return Math.hypot(cb.x - ca.x, cb.y - ca.y);
+}
+
+// ============================================================
+// Shared body pieces: swing, knockback, getting hit
+// ============================================================
+function newSwing(angle) {
+  return { t: 0, angle, hit: new Set() }; // hit = ids already struck this swing
+}
+
+// Current blade angle during a swing: sweeps across the arc, easing out.
+function bladeAngle(swing) {
+  const u = Math.min(1, swing.t / SWING_TIME);
+  const eased = 1 - (1 - u) * (1 - u);
+  return swing.angle - SWING_ARC / 2 + SWING_ARC * eased;
+}
+
+// Is any part of the box within reach of the blade's path so far?
+// Checks points along the blade from the start of the arc to its current angle.
+function swingTouches(swinger, box) {
+  const s = swinger.swing;
+  if (!s) return false;
+  const cx = swinger.x + swinger.size / 2;
+  const cy = swinger.y + swinger.size / 2;
+  const a0 = s.angle - SWING_ARC / 2;
+  const a1 = bladeAngle(s);
+  const steps = 12;
+  for (let i = 0; i <= steps; i++) {
+    const a = a0 + (a1 - a0) * (i / steps);
+    for (let r = swinger.size / 2; r <= SWING_REACH; r += 6) {
+      const px = cx + Math.cos(a) * r;
+      const py = cy + Math.sin(a) * r;
+      if (px >= box.x && px <= box.x + box.size && py >= box.y && py <= box.y + box.size) return true;
+    }
+  }
+  return false;
+}
+
+// Push the target away from the attacker.
+function knockBack(target, from) {
+  const a = centerOf(from), b = centerOf(target);
+  let dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  target.knock = { x: dx / len, y: dy / len, t: KNOCKBACK_TIME };
+}
+
+function applyKnockback(room, ent, dt) {
+  const k = ent.knock;
+  if (!k || k.t <= 0) return;
+  const speed = KNOCKBACK_SPEED * (k.t / KNOCKBACK_TIME); // slows to a stop
+  moveAxis(room, ent, k.x * speed * dt, 0);
+  moveAxis(room, ent, 0, k.y * speed * dt);
+  k.t = Math.max(0, k.t - dt);
+}
+
+// ============================================================
+// Player
+// ============================================================
+function makePlayer(room) {
+  // Start in the middle of the room. x, y = top-left of the hitbox.
+  return {
+    id: "player",
+    x: (room.w * TILE) / 2 - PLAYER_SIZE / 2,
+    y: (room.h * TILE) / 2 - PLAYER_SIZE / 2,
+    size: PLAYER_SIZE,
+    hp: PLAYER_MAX_HP,
+    iframes: 0,             // >0: can't be hurt
+    flash: 0,
+    knock: null,
+    facing: { x: 0, y: 1 }, // last direction moved; sword swings this way
+    swing: null,            // { t, angle, hit: Set } while swinging, else null
+    cooldown: 0,            // time until another swing may start
+    facingLock: 0,          // >0 after a swing ends: facing can't turn yet
+    buffered: 0,            // >0 while a queued swing press is still fresh
+    chainAngle: null,       // set when the queued press came mid-swing or just after: next swing repeats this angle
+    lastAngle: 0,           // direction of the most recent swing
+    sinceSwing: Infinity,   // time since the last swing ended
+  };
+}
+
 // input = { up, down, left, right, attack }
 //   up/down/left/right: held booleans
 //   attack: true only on the step the attack key was pressed
 function updatePlayer(room, player, input, dt) {
+  if (player.iframes > 0) player.iframes = Math.max(0, player.iframes - dt);
+  if (player.flash > 0) player.flash = Math.max(0, player.flash - dt);
+  applyKnockback(room, player, dt);
+
   // --- Sword ---
   // Pressing again late in a swing, or within CHAIN_GRACE after it ends, "chains":
   // the next swing goes the same direction even if you're walking another way
@@ -174,11 +279,7 @@ function updatePlayer(room, player, input, dt) {
       player.facing = { x: Math.cos(angle), y: Math.sin(angle) };
       player.chainAngle = null;
     }
-    player.swing = {
-      t: 0,
-      angle,             // locked at swing start
-      hit: new Set(),    // targets already hit this swing
-    };
+    player.swing = newSwing(angle); // angle locked at swing start
   }
 
   // --- Movement ---
@@ -199,72 +300,213 @@ function updatePlayer(room, player, input, dt) {
   moveAxis(room, player, 0, iy * dist);
 }
 
-// Current blade angle during a swing: sweeps across the arc, easing out.
-function bladeAngle(swing) {
-  const u = Math.min(1, swing.t / SWING_TIME);
-  const eased = 1 - (1 - u) * (1 - u);
-  return swing.angle - SWING_ARC / 2 + SWING_ARC * eased;
-}
-
-// Is any part of the box within reach of the blade's path so far?
-// Checks points along the blade from the start of the arc to its current angle.
-function swingTouches(player, box) {
-  const s = player.swing;
-  if (!s) return false;
-  const cx = player.x + player.size / 2;
-  const cy = player.y + player.size / 2;
-  const a0 = s.angle - SWING_ARC / 2;
-  const a1 = bladeAngle(s);
-  const steps = 12;
-  for (let i = 0; i <= steps; i++) {
-    const a = a0 + (a1 - a0) * (i / steps);
-    for (let r = player.size / 2; r <= SWING_REACH; r += 6) {
-      const px = cx + Math.cos(a) * r;
-      const py = cy + Math.sin(a) * r;
-      if (px >= box.x && px <= box.x + box.size && py >= box.y && py <= box.y + box.size) return true;
-    }
-  }
-  return false;
-}
-
 // ============================================================
-// Practice dummies (stand-ins for enemies until skeletons exist)
+// Skeletons
 // ============================================================
-function makeDummy(id, tx, ty) {
+// Simple brain: idle (wander) until the player comes close, then chase and
+// attack. Attacks are telegraphed by a short wind-up; hitting a skeleton
+// during its wind-up or swing cancels the attack.
+function makeSkeleton(id, x, y, rng) {
   return {
     id,
-    x: tx * TILE + (TILE - DUMMY_SIZE) / 2,
-    y: ty * TILE + (TILE - DUMMY_SIZE) / 2,
-    size: DUMMY_SIZE,
+    x, y,
+    size: SKEL_SIZE,
+    hp: SKEL_HP,
     flash: 0,
-    hits: 0,
+    knock: null,
+    facing: { x: 0, y: 1 },
+    aggro: false,
+    swing: null,
+    windup: 0,          // >0 while winding up an attack
+    windupAngle: 0,
+    cooldown: 0,
+    stun: 0,
+    wanderT: rng() * 1.5,        // time until next wander decision
+    wanderDir: null,             // { x, y } or null (standing still)
   };
 }
 
-function updateDummies(game, dt) {
-  const p = game.player;
-  for (const d of game.dummies) {
-    if (d.flash > 0) d.flash = Math.max(0, d.flash - dt);
-    if (p.swing && !p.swing.hit.has(d.id) && swingTouches(p, d)) {
-      p.swing.hit.add(d.id); // one hit per swing per target
-      d.flash = HIT_FLASH;
-      d.hits++;
+function updateSkeleton(game, sk, dt) {
+  const room = game.room, p = game.player, rng = game.rng;
+  if (sk.flash > 0) sk.flash = Math.max(0, sk.flash - dt);
+  if (sk.cooldown > 0) sk.cooldown = Math.max(0, sk.cooldown - dt);
+  applyKnockback(room, sk, dt);
+  if (sk.stun > 0) { sk.stun = Math.max(0, sk.stun - dt); return; }
+
+  const d = distBetween(sk, p);
+  const playerAlive = !game.over;
+  if (!sk.aggro && playerAlive && d <= SKEL_AGGRO_RANGE) sk.aggro = true;
+  if (sk.aggro && (!playerAlive || d > SKEL_LEASH_RANGE)) sk.aggro = false;
+
+  // Swinging
+  if (sk.swing) {
+    sk.swing.t += dt;
+    if (playerAlive && !sk.swing.hit.has(p.id) && swingTouches(sk, p)) {
+      sk.swing.hit.add(p.id);
+      hurtPlayer(game, sk);
+    }
+    if (sk.swing.t >= SWING_TIME) {
+      sk.swing = null;
+      sk.cooldown = SKEL_COOLDOWN;
+    }
+    return; // stands still while swinging
+  }
+
+  // Winding up
+  if (sk.windup > 0) {
+    sk.windup = Math.max(0, sk.windup - dt);
+    if (sk.windup === 0) sk.swing = newSwing(sk.windupAngle);
+    return;
+  }
+
+  const sc = centerOf(sk), pc = centerOf(p);
+  if (sk.aggro) {
+    const ax = pc.x - sc.x, ay = pc.y - sc.y;
+    const len = Math.hypot(ax, ay) || 1;
+    sk.facing = { x: ax / len, y: ay / len };
+    if (d <= SKEL_ATTACK_RANGE && sk.cooldown === 0) {
+      sk.windup = SKEL_WINDUP;
+      sk.windupAngle = Math.atan2(ay, ax);
+    } else if (d > SKEL_STOP_RANGE) {
+      moveAxis(room, sk, sk.facing.x * SKEL_SPEED * dt, 0);
+      moveAxis(room, sk, 0, sk.facing.y * SKEL_SPEED * dt);
+    }
+  } else {
+    // Wander: alternate between short strolls and standing around.
+    sk.wanderT -= dt;
+    if (sk.wanderT <= 0) {
+      if (rng() < 0.5) {
+        const a = rng() * Math.PI * 2;
+        sk.wanderDir = { x: Math.cos(a), y: Math.sin(a) };
+        sk.facing = sk.wanderDir;
+      } else {
+        sk.wanderDir = null;
+      }
+      sk.wanderT = 0.8 + rng() * 1.6;
+    }
+    if (sk.wanderDir) {
+      moveAxis(room, sk, sk.wanderDir.x * SKEL_WANDER_SPEED * dt, 0);
+      moveAxis(room, sk, 0, sk.wanderDir.y * SKEL_WANDER_SPEED * dt);
     }
   }
+}
+
+// Skeletons nudge each other apart so they don't stack into one blob.
+function separateSkeletons(game, dt) {
+  const list = game.skeletons;
+  for (let i = 0; i < list.length; i++) {
+    for (let j = i + 1; j < list.length; j++) {
+      const a = list[i], b = list[j];
+      const ca = centerOf(a), cb = centerOf(b);
+      let dx = cb.x - ca.x, dy = cb.y - ca.y;
+      let d = Math.hypot(dx, dy);
+      const min = (a.size + b.size) / 2 + 4;
+      if (d >= min) continue;
+      if (d < 1e-6) { dx = 1; dy = 0; d = 1; }
+      const push = Math.min((min - d) / 2, 120 * dt);
+      moveAxis(game.room, a, (-dx / d) * push, (-dy / d) * push);
+      moveAxis(game.room, b, (dx / d) * push, (dy / d) * push);
+    }
+  }
+}
+
+function spawnWave(game, count) {
+  const p = game.player, rng = game.rng, room = game.room;
+  for (let n = 0; n < count; n++) {
+    for (let tries = 0; tries < 200; tries++) {
+      const x = TILE + rng() * ((room.w - 2) * TILE - SKEL_SIZE);
+      const y = TILE + rng() * ((room.h - 2) * TILE - SKEL_SIZE);
+      const probe = { x, y, size: SKEL_SIZE };
+      if (boxHitsWall(room, x, y, SKEL_SIZE)) continue;
+      if (distBetween(probe, p) < SPAWN_MIN_DIST) continue;
+      if (game.skeletons.some((s) => distBetween(probe, s) < SKEL_SIZE * 2)) continue;
+      game.skeletons.push(makeSkeleton(game.nextId++, x, y, rng));
+      break;
+    }
+  }
+}
+
+// ============================================================
+// Combat
+// ============================================================
+function hurtPlayer(game, attacker) {
+  const p = game.player;
+  if (p.iframes > 0 || game.over) return;
+  p.hp -= 1;
+  p.iframes = PLAYER_IFRAMES;
+  p.flash = HIT_FLASH;
+  knockBack(p, attacker);
+  if (p.hp <= 0) {
+    p.hp = 0;
+    p.swing = null;
+    game.over = true;
+  }
+}
+
+function playerAttacks(game) {
+  const p = game.player;
+  if (!p.swing) return;
+  for (const sk of game.skeletons) {
+    if (sk.hp <= 0 || p.swing.hit.has(sk.id) || !swingTouches(p, sk)) continue;
+    p.swing.hit.add(sk.id); // one hit per swing per target
+    sk.hp -= 1;
+    sk.flash = HIT_FLASH;
+    sk.stun = SKEL_STUN;
+    sk.aggro = true;
+    sk.windup = 0;          // interrupt its attack
+    sk.swing = null;
+    knockBack(sk, p);
+    if (sk.hp <= 0) {
+      game.effects.push({ kind: "bones", x: sk.x, y: sk.y, size: sk.size, t: 0.4, max: 0.4 });
+      game.kills++;
+    }
+  }
+  game.skeletons = game.skeletons.filter((s) => s.hp > 0);
 }
 
 // ============================================================
 // Game state
 // ============================================================
-function makeGame() {
+// opts.skeletons === false: empty room (used by movement tests)
+function makeGame(seed, opts) {
   const room = makeRoom(ROOM_W, ROOM_H);
-  const dummies = [makeDummy(1, 9, 10), makeDummy(2, 20, 10)];
-  return { room, player: makePlayer(room), dummies };
+  const game = {
+    room,
+    player: makePlayer(room),
+    skeletons: [],
+    effects: [],
+    rng: makeRng(seed === undefined ? 1 : seed),
+    nextId: 1,
+    kills: 0,
+    waveTimer: 0,
+    over: false,
+    waves: !(opts && opts.skeletons === false),
+  };
+  if (game.waves) spawnWave(game, WAVE_SIZE);
+  return game;
 }
 
 function stepGame(game, input, dt) {
+  if (game.over) {
+    for (const sk of game.skeletons) updateSkeleton(game, sk, dt); // they mill about
+    return;
+  }
   updatePlayer(game.room, game.player, input, dt);
-  updateDummies(game, dt);
+  playerAttacks(game);
+  for (const sk of game.skeletons) updateSkeleton(game, sk, dt);
+  separateSkeletons(game, dt);
+
+  for (const e of game.effects) e.t -= dt;
+  game.effects = game.effects.filter((e) => e.t > 0);
+
+  // Next wave once the room is clear.
+  if (game.waves && game.skeletons.length === 0) {
+    game.waveTimer += dt;
+    if (game.waveTimer >= WAVE_DELAY) {
+      game.waveTimer = 0;
+      spawnWave(game, WAVE_SIZE);
+    }
+  }
 }
 
 // ============================================================
@@ -289,14 +531,17 @@ function drawRoom(ctx, room) {
   }
 }
 
-function drawPlayer(ctx, p) {
+function drawPlayer(ctx, p, over) {
+  // Blink while invincible.
+  if (!over && p.iframes > 0 && Math.floor(p.iframes * 20) % 2 === 0) return;
   const cx = p.x + p.size / 2;
   const cy = p.y + p.size / 2;
-  ctx.fillStyle = "#d9b45a";
+  ctx.fillStyle = p.flash > 0 ? "#ffffff" : over ? "#6b5a34" : "#d9b45a";
   ctx.fillRect(p.x, p.y, p.size, p.size);
   ctx.strokeStyle = "#7a5c1e";
   ctx.lineWidth = 2;
   ctx.strokeRect(p.x + 1, p.y + 1, p.size - 2, p.size - 2);
+  if (over) return;
   // Facing marker
   ctx.fillStyle = "#fff4d0";
   ctx.beginPath();
@@ -304,54 +549,117 @@ function drawPlayer(ctx, p) {
   ctx.fill();
 }
 
-function drawDummy(ctx, d) {
-  const cx = d.x + d.size / 2;
-  // Post
-  ctx.fillStyle = "#5a3f26";
-  ctx.fillRect(cx - 3, d.y + d.size - 4, 6, 8);
-  // Body
-  ctx.fillStyle = d.flash > 0 ? "#ffffff" : "#a07a4c";
-  ctx.fillRect(d.x, d.y, d.size, d.size - 4);
-  ctx.strokeStyle = "#4a3420";
+function drawSkeleton(ctx, sk) {
+  const cx = sk.x + sk.size / 2;
+  const cy = sk.y + sk.size / 2;
+  ctx.fillStyle = sk.flash > 0 ? "#ffffff" : "#d8d4c6";
+  ctx.fillRect(sk.x, sk.y, sk.size, sk.size);
+  ctx.strokeStyle = "#7d786a";
   ctx.lineWidth = 2;
-  ctx.strokeRect(d.x + 1, d.y + 1, d.size - 2, d.size - 6);
-  // Hit counter
-  ctx.fillStyle = "#cfc6b8";
-  ctx.font = "12px monospace";
-  ctx.textAlign = "center";
-  ctx.fillText(String(d.hits), cx, d.y - 6);
+  ctx.strokeRect(sk.x + 1, sk.y + 1, sk.size - 2, sk.size - 2);
+  // Eyes look where it faces; red when it has noticed you.
+  const fx = sk.facing.x, fy = sk.facing.y;
+  const px = -fy, py = fx; // perpendicular
+  ctx.fillStyle = sk.aggro ? "#d0342c" : "#2a2622";
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.arc(cx + fx * 5 + px * 4 * side, cy + fy * 5 + py * 4 * side, 2.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // Wind-up telegraph: blade drawn back, glowing brighter as the swing nears.
+  if (sk.windup > 0) {
+    const k = 1 - sk.windup / SKEL_WINDUP;
+    const a = sk.windupAngle - SWING_ARC / 2 - 0.5;
+    ctx.strokeStyle = `rgba(255, 120, 90, ${0.35 + 0.65 * k})`;
+    ctx.lineWidth = 4;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(a) * (sk.size / 2), cy + Math.sin(a) * (sk.size / 2));
+    ctx.lineTo(cx + Math.cos(a) * SWING_REACH, cy + Math.sin(a) * SWING_REACH);
+    ctx.stroke();
+    ctx.lineCap = "butt";
+  }
+  // Health pips (only once damaged)
+  if (sk.hp < SKEL_HP) {
+    for (let i = 0; i < SKEL_HP; i++) {
+      ctx.fillStyle = i < sk.hp ? "#d0342c" : "#3a2a28";
+      ctx.fillRect(sk.x + i * 7, sk.y - 7, 5, 3);
+    }
+  }
 }
 
-function drawSwing(ctx, p) {
-  const s = p.swing;
+function drawSwing(ctx, ent, trail, blade) {
+  const s = ent.swing;
   if (!s) return;
-  const cx = p.x + p.size / 2;
-  const cy = p.y + p.size / 2;
+  const cx = ent.x + ent.size / 2;
+  const cy = ent.y + ent.size / 2;
   const a0 = s.angle - SWING_ARC / 2;
   const a = bladeAngle(s);
   // Faint trail over the part of the arc already swept
-  ctx.fillStyle = "rgba(230, 235, 255, 0.18)";
+  ctx.fillStyle = trail;
   ctx.beginPath();
   ctx.moveTo(cx, cy);
   ctx.arc(cx, cy, SWING_REACH, a0, a);
   ctx.closePath();
   ctx.fill();
   // Blade
-  ctx.strokeStyle = "#e8ecf8";
+  ctx.strokeStyle = blade;
   ctx.lineWidth = 4;
   ctx.lineCap = "round";
   ctx.beginPath();
-  ctx.moveTo(cx + Math.cos(a) * (p.size / 2), cy + Math.sin(a) * (p.size / 2));
+  ctx.moveTo(cx + Math.cos(a) * (ent.size / 2), cy + Math.sin(a) * (ent.size / 2));
   ctx.lineTo(cx + Math.cos(a) * SWING_REACH, cy + Math.sin(a) * SWING_REACH);
   ctx.stroke();
   ctx.lineCap = "butt";
 }
 
+function drawEffects(ctx, game) {
+  for (const e of game.effects) {
+    if (e.kind !== "bones") continue;
+    const k = e.t / e.max;           // 1 → 0
+    const spread = (1 - k) * 10;
+    ctx.fillStyle = `rgba(216, 212, 198, ${k})`;
+    const c = e.size / 2;
+    for (const [dx, dy] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+      ctx.fillRect(e.x + c + dx * spread - 4, e.y + c + dy * spread - 4, 8, 8);
+    }
+  }
+}
+
+function drawHud(ctx, game) {
+  const p = game.player;
+  for (let i = 0; i < PLAYER_MAX_HP; i++) {
+    ctx.fillStyle = i < p.hp ? "#d0342c" : "#2a1c1c";
+    ctx.fillRect(10 + i * 22, 9, 16, 14);
+    ctx.strokeStyle = "#1a1212";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(10 + i * 22, 9, 16, 14);
+  }
+  ctx.fillStyle = "#cfc6b8";
+  ctx.font = "14px monospace";
+  ctx.textAlign = "right";
+  ctx.fillText("Skeletons slain: " + game.kills, ROOM_W * TILE - 12, 21);
+
+  if (game.over) {
+    ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
+    ctx.fillRect(0, 0, ROOM_W * TILE, ROOM_H * TILE);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#e8dcc4";
+    ctx.font = "40px monospace";
+    ctx.fillText("You died", (ROOM_W * TILE) / 2, (ROOM_H * TILE) / 2 - 10);
+    ctx.font = "16px monospace";
+    ctx.fillText("Press R to try again", (ROOM_W * TILE) / 2, (ROOM_H * TILE) / 2 + 24);
+  }
+}
+
 function draw(ctx, game) {
   drawRoom(ctx, game.room);
-  for (const d of game.dummies) drawDummy(ctx, d);
-  drawPlayer(ctx, game.player);
-  drawSwing(ctx, game.player);
+  drawEffects(ctx, game);
+  for (const sk of game.skeletons) drawSkeleton(ctx, sk);
+  drawPlayer(ctx, game.player, game.over);
+  for (const sk of game.skeletons) drawSwing(ctx, sk, "rgba(255, 110, 80, 0.20)", "#f0c8b8");
+  drawSwing(ctx, game.player, "rgba(230, 235, 255, 0.18)", "#e8ecf8");
+  drawHud(ctx, game);
 }
 
 // ============================================================
@@ -360,7 +668,7 @@ function draw(ctx, game) {
 if (typeof window !== "undefined" && typeof document !== "undefined" && document.getElementById) {
   const canvas = document.getElementById("game");
   const ctx = canvas.getContext("2d");
-  const game = makeGame();
+  let game = makeGame((Math.random() * 1e9) | 0);
   const input = { up: false, down: false, left: false, right: false, attack: false };
   let attackPressed = false; // set by keydown, consumed by the next simulation step
 
@@ -374,6 +682,10 @@ if (typeof window !== "undefined" && typeof document !== "undefined" && document
     if (e.code === "Space") {
       if (!e.repeat) attackPressed = true; // one swing per press; holding doesn't auto-swing
       e.preventDefault();
+      return;
+    }
+    if (e.code === "KeyR" && game.over) {
+      game = makeGame((Math.random() * 1e9) | 0);
       return;
     }
     const k = KEYMAP[e.code];
