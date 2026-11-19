@@ -1368,6 +1368,7 @@ function enterFloor(game, n, via) {
   game.skeletons = [];
   for (const r of room.rooms) for (const sp of r.spawns) game.skeletons.push(skeletonFromSpawn(game, sp, r));
   game.deepestFloor = Math.max(game.deepestFloor, n);
+  if (room.timeOnFloor === undefined) room.timeOnFloor = 0;   // testing readout
   if (room.safe && n >= game.checkpointFloor) game.checkpointFloor = n;
   growMaze(game);
   computeVisibility(game);
@@ -1464,6 +1465,7 @@ function stepGame(game, input, dt) {
   }
   updatePlayer(game.room, game.player, input, dt);
   if (game.area === "maze") {
+    game.room.timeOnFloor = (game.room.timeOnFloor || 0) + dt;
     if (checkStairs(game)) return;
     updateSafeRoom(game, dt);
     growMaze(game);
@@ -1849,6 +1851,9 @@ function drawHud(ctx, game) {
       ctx.fillText("built " + Math.round(f * 100) + "%  \u00b7  " +
         (r.exit ? "exit is out there" : "exit chance " + (exitChance(f) * 100).toFixed(1) + "%") +
         "  \u00b7  checkpoint F" + game.checkpointFloor, VIEW_W - 12, 38);
+      const t = Math.floor(r.timeOnFloor || 0);
+      ctx.fillText(r.cellsW + "x" + r.cellsH + " cells  \u00b7  time on this floor " + Math.floor(t / 60) + ":" +
+        String(t % 60).padStart(2, "0"), VIEW_W - 12, 52);
     }
   }
   ctx.textAlign = "center";

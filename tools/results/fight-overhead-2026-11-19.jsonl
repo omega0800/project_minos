@@ -1,0 +1,6 @@
+{"cells":23,"seed":1,"enemies":false,"gameSeconds":177,"done":true,"deaths":0,"kills":0}
+{"cells":23,"seed":2,"enemies":false,"gameSeconds":190,"done":true,"deaths":0,"kills":0}
+{"cells":23,"seed":3,"enemies":false,"gameSeconds":183,"done":true,"deaths":0,"kills":0}
+{"cells":23,"seed":1,"enemies":true,"gameSeconds":188,"done":true,"deaths":0,"kills":25}
+{"cells":23,"seed":2,"enemies":true,"gameSeconds":199,"done":true,"deaths":0,"kills":21}
+{"cells":23,"seed":3,"enemies":true,"gameSeconds":183,"done":true,"deaths":0,"kills":13}
