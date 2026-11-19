@@ -14,7 +14,8 @@ function loadGame() {
   const ctx = {};
   vm.createContext(ctx);
   vm.runInContext(
-    m[1] + "\n;this.__api = { TILE, ROOM_W, ROOM_H, STEP, PLAYER_SPEED, WALL, FLOOR, makeGame, stepGame, tileAt, boxHitsWall };",
+    m[1] + "\n;this.__api = { TILE, ROOM_W, ROOM_H, STEP, PLAYER_SPEED, WALL, FLOOR, makeGame, stepGame, tileAt, boxHitsWall," +
+      " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER };",
     ctx
   );
   return ctx.__api;
@@ -108,6 +109,79 @@ console.log("Long random walk never leaves the room");
     if (G.boxHitsWall(g.room, g.player.x, g.player.y, g.player.size)) { escaped = true; break; }
   }
   check("20,000 random steps, never inside a wall", !escaped);
+}
+
+console.log("Sword");
+{
+  const attack = Object.assign({}, none, { attack: true });
+
+  const g = makeFresh();
+  G.stepGame(g, attack, G.STEP);
+  check("pressing attack starts a swing", !!g.player.swing);
+  run(g, none, G.SWING_TIME + G.STEP);
+  check("swing ends after SWING_TIME", !g.player.swing && g.player.cooldown > 0);
+  G.stepGame(g, attack, G.STEP);
+  check("can't swing again during cooldown (press is buffered)", !g.player.swing && g.player.buffered > 0);
+  run(g, none, G.SWING_COOLDOWN);
+  check("buffered press swings once cooldown ends", !!g.player.swing);
+
+  const h = makeFresh();
+  G.stepGame(h, attack, G.STEP);
+  run(h, none, G.SWING_TIME + G.SWING_COOLDOWN + 0.5);
+  check("one press = one swing (no auto-repeat)", !h.player.swing);
+
+  const late = makeFresh();
+  G.stepGame(late, attack, G.STEP);
+  run(late, none, 0.02);
+  G.stepGame(late, attack, G.STEP);     // early press mid-swing...
+  run(late, none, G.SWING_TIME + G.SWING_COOLDOWN);
+  check("a press long before the swing ends is dropped", !late.player.swing);
+
+  const mv = makeFresh();
+  const x0 = mv.player.x;
+  G.stepGame(mv, Object.assign({}, attack, { right: true }), G.STEP);
+  run(mv, hold({ right: true }), 0.1);
+  const moved = mv.player.x - x0;
+  const expect = G.PLAYER_SPEED * G.SWING_MOVE_MULT * (0.1 + G.STEP);
+  check("movement slowed while swinging", Math.abs(moved - expect) < 1, "moved " + moved.toFixed(2) + ", expected " + expect.toFixed(2));
+
+  const f = makeFresh();
+  f.player.facing = { x: 0, y: 1 };
+  G.stepGame(f, Object.assign({}, attack, { right: true }), G.STEP);
+  run(f, hold({ right: true }), 0.1);
+  check("facing stays locked mid-swing", f.player.facing.x === 0 && f.player.facing.y === 1);
+}
+
+console.log("Sword vs dummies");
+{
+  const attack = Object.assign({}, none, { attack: true });
+  function besideDummy(facingX) {
+    const g = makeFresh();
+    const d = g.dummies[0];
+    // Stand just left of the dummy, a small gap between them.
+    g.player.x = d.x - g.player.size - 8;
+    g.player.y = d.y + (d.size - g.player.size) / 2;
+    g.player.facing = { x: facingX, y: 0 };
+    return g;
+  }
+  const g = besideDummy(1);
+  G.stepGame(g, attack, G.STEP);
+  run(g, none, G.SWING_TIME);
+  check("swing toward a dummy hits it", g.dummies[0].hits === 1, "hits=" + g.dummies[0].hits);
+  check("only one hit per swing", g.dummies[0].hits === 1);
+  check("far dummy untouched", g.dummies[1].hits === 0);
+
+  const away = besideDummy(-1);
+  G.stepGame(away, attack, G.STEP);
+  run(away, none, G.SWING_TIME);
+  check("swing facing away misses", away.dummies[0].hits === 0);
+
+  const twice = besideDummy(1);
+  for (let i = 0; i < 2; i++) {
+    G.stepGame(twice, attack, G.STEP);
+    run(twice, none, G.SWING_TIME + G.SWING_COOLDOWN);
+  }
+  check("two swings = two hits", twice.dummies[0].hits === 2, "hits=" + twice.dummies[0].hits);
 }
 
 function makeFresh() { return G.makeGame(); }
