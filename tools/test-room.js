@@ -15,7 +15,7 @@ function loadGame() {
   vm.createContext(ctx);
   vm.runInContext(
     m[1] + "\n;this.__api = { TILE, ROOM_W, ROOM_H, STEP, PLAYER_SPEED, WALL, FLOOR, makeGame, stepGame, tileAt, boxHitsWall," +
-      " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER };",
+      " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER, FACING_LOCK_EXTRA };",
     ctx
   );
   return ctx.__api;
@@ -150,6 +150,17 @@ console.log("Sword");
   G.stepGame(f, Object.assign({}, attack, { right: true }), G.STEP);
   run(f, hold({ right: true }), 0.1);
   check("facing stays locked mid-swing", f.player.facing.x === 0 && f.player.facing.y === 1);
+
+  const fl = makeFresh();
+  fl.player.facing = { x: 0, y: 1 };
+  G.stepGame(fl, attack, G.STEP);
+  run(fl, none, G.SWING_TIME + G.STEP);       // swing just ended
+  run(fl, hold({ right: true }), G.FACING_LOCK_EXTRA / 2);
+  check("facing still locked just after the swing", fl.player.facing.x === 0 && fl.player.facing.y === 1);
+  const xa = fl.player.x;
+  run(fl, hold({ right: true }), 0.1);
+  check("normal speed right after the swing", Math.abs((fl.player.x - xa) - G.PLAYER_SPEED * 0.1) < 1);
+  check("facing turns once the lock ends", fl.player.facing.x === 1);
 }
 
 console.log("Sword vs dummies");

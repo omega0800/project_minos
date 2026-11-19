@@ -36,6 +36,7 @@ const SWING_TIME = 0.198;         // how long one swing lasts
 const SWING_COOLDOWN = 0.108;     // pause after a swing before the next can start
 const SWING_ARC = Math.PI * 2 / 3; // 120 degrees, centered on facing
 const SWING_REACH = 40;           // blade tip distance from player center, pixels
+const FACING_LOCK_EXTRA = 0.08;   // facing stays locked this long after a swing ends
 const SWING_MOVE_MULT = 0.5;      // movement speed while swinging
 const SWING_BUFFER = 0.12;        // a press this close to the end of a swing queues the next one
 
@@ -83,6 +84,7 @@ function makePlayer(room) {
     facing: { x: 0, y: 1 }, // last direction moved; sword swings this way
     swing: null,            // { t, angle, hit: Set } while swinging, else null
     cooldown: 0,            // time until another swing may start
+    facingLock: 0,          // >0 after a swing ends: facing can't turn yet
     buffered: 0,            // >0 while a queued swing press is still fresh
   };
 }
@@ -139,9 +141,11 @@ function updatePlayer(room, player, input, dt) {
     if (player.swing.t >= SWING_TIME) {
       player.swing = null;
       player.cooldown = SWING_COOLDOWN;
+      player.facingLock = FACING_LOCK_EXTRA;
     }
-  } else if (player.cooldown > 0) {
-    player.cooldown = Math.max(0, player.cooldown - dt);
+  } else {
+    if (player.cooldown > 0) player.cooldown = Math.max(0, player.cooldown - dt);
+    if (player.facingLock > 0) player.facingLock = Math.max(0, player.facingLock - dt);
   }
   if (!player.swing && player.cooldown === 0 && player.buffered > 0) {
     player.buffered = 0;
@@ -161,8 +165,8 @@ function updatePlayer(room, player, input, dt) {
   const len = Math.hypot(ix, iy);
   ix /= len;
   iy /= len;
-  // Facing doesn't turn mid-swing, so the swing keeps its direction.
-  if (!player.swing) player.facing = { x: ix, y: iy };
+  // Facing doesn't turn mid-swing (or just after), so the swing keeps its direction.
+  if (!player.swing && player.facingLock === 0) player.facing = { x: ix, y: iy };
 
   const dist = PLAYER_SPEED * (player.swing ? SWING_MOVE_MULT : 1) * dt;
   moveAxis(room, player, ix * dist, 0);
