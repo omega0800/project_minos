@@ -86,6 +86,7 @@ function makePlayer(room) {
     cooldown: 0,            // time until another swing may start
     facingLock: 0,          // >0 after a swing ends: facing can't turn yet
     buffered: 0,            // >0 while a queued swing press is still fresh
+    chainAngle: null,       // set when the queued press came mid-swing: next swing repeats this angle
   };
 }
 
@@ -133,8 +134,18 @@ function moveAxis(room, ent, dx, dy) {
 //   attack: true only on the step the attack key was pressed
 function updatePlayer(room, player, input, dt) {
   // --- Sword ---
-  if (input.attack) player.buffered = SWING_BUFFER;
-  else if (player.buffered > 0) player.buffered = Math.max(0, player.buffered - dt);
+  // Pressing again before a swing finishes "chains" it: the next swing goes the
+  // same direction even if you've started walking another way (lets you back up
+  // while swinging). A press after the swing ends uses your current facing.
+  if (input.attack) {
+    player.buffered = SWING_BUFFER;
+    player.chainAngle = player.swing ? player.swing.angle : null;
+  } else if (player.buffered > 0 && player.cooldown === 0) {
+    // The buffer only runs down while a swing could otherwise act on it,
+    // so a press late in a swing survives the cooldown that follows.
+    player.buffered = Math.max(0, player.buffered - dt);
+    if (player.buffered === 0) player.chainAngle = null;
+  }
 
   if (player.swing) {
     player.swing.t += dt;
@@ -149,10 +160,16 @@ function updatePlayer(room, player, input, dt) {
   }
   if (!player.swing && player.cooldown === 0 && player.buffered > 0) {
     player.buffered = 0;
+    let angle = Math.atan2(player.facing.y, player.facing.x);
+    if (player.chainAngle !== null) {
+      angle = player.chainAngle;
+      player.facing = { x: Math.cos(angle), y: Math.sin(angle) };
+      player.chainAngle = null;
+    }
     player.swing = {
       t: 0,
-      angle: Math.atan2(player.facing.y, player.facing.x), // locked at swing start
-      hit: new Set(),                                      // targets already hit this swing
+      angle,             // locked at swing start
+      hit: new Set(),    // targets already hit this swing
     };
   }
 

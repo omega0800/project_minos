@@ -161,6 +161,28 @@ console.log("Sword");
   run(fl, hold({ right: true }), 0.1);
   check("normal speed right after the swing", Math.abs((fl.player.x - xa) - G.PLAYER_SPEED * 0.1) < 1);
   check("facing turns once the lock ends", fl.player.facing.x === 1);
+
+  // Backing up while swinging: face right, walk left the whole time.
+  function backingUp(pressAt) {
+    const g = makeFresh();
+    g.player.facing = { x: 1, y: 0 };
+    const back = hold({ left: true });
+    G.stepGame(g, Object.assign({}, back, { attack: true }), G.STEP);
+    run(g, back, pressAt);
+    G.stepGame(g, Object.assign({}, back, { attack: true }), G.STEP);
+    let second = null;
+    for (let i = 0; i < 60 && !second; i++) {
+      G.stepGame(g, back, G.STEP);
+      if (g.player.swing && g.player.swing.t < G.STEP * 1.5) second = g.player.swing;
+    }
+    return second;
+  }
+  const chained = backingUp(0.13);   // pressed before the first swing finishes
+  check("press mid-swing while backing up: next swing keeps direction",
+    chained && Math.abs(chained.angle - 0) < 1e-9, chained ? "angle=" + chained.angle.toFixed(2) : "no swing");
+  const lateP = backingUp(G.SWING_TIME + 0.09); // pressed after it finished
+  check("press after the swing while backing up: next swing turns around",
+    lateP && Math.abs(Math.abs(lateP.angle) - Math.PI) < 1e-9, lateP ? "angle=" + lateP.angle.toFixed(2) : "no swing");
 }
 
 console.log("Sword vs dummies");
