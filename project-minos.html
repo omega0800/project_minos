@@ -34,7 +34,10 @@ const ROOM_H = 20;
 // hallway is 2 tiles wide. Cell (cx, cy) has floor tiles
 // (3cx+1 .. 3cx+2, 3cy+1 .. 3cy+2); walls sit on multiples of 3.
 const CELL = 3;
-const FLOOR_CELLS = 31;     // floor size in cells for now (31 x 31 cells = 94 x 94 tiles)
+const FLOOR_CELLS = 31;     // default floor size in cells when a fixed size is asked for (tests)
+const FLOOR_MIN_CELLS = 19, FLOOR_MAX_CELLS = 25; // each floor is a random odd size in this range (for now)
+const SAFE_EVERY = 3;       // floors 1, 4, 7, ... have a safe room (3 while testing)
+const EXIT_K = 6;           // exit chance curve: X = (e^(k f) - 1) / (e^k - 1), f = fraction of floor built
 
 // Maze generation
 const BRANCH_CHANCE = 0.4;  // chance each side of a new cell opens into untouched space (q)
@@ -137,6 +140,8 @@ const VOID = 2;   // solid emptiness outside a room (drawn black)
 const HEAL = 3;   // aquamarine floor: standing on it heals
 const DOOR = 4;   // open doorway (walkable)
 const NPC = 5;    // the tile the NPC stands on (solid)
+const STAIRS_DOWN = 6; // walk onto it to go down a floor
+const STAIRS_UP = 7;   // walk onto it to go back up
 
 // Safe room
 const HEAL_INTERVAL = 0.5;        // seconds per 1 HP healed while on a heal tile
@@ -200,7 +205,7 @@ function isSolid(room, tx, ty) {
 }
 
 function isWalkable(t) {
-  return t === FLOOR || t === HEAL || t === DOOR;
+  return t === FLOOR || t === HEAL || t === DOOR || t === STAIRS_DOWN || t === STAIRS_UP;
 }
 
 // ---------- Maze floors ----------
@@ -252,7 +257,11 @@ function wallUp(room) {
 // 7 x 6 cells. It has a healing nook in its top wall, the Old Man, and a
 // 2-wide doorway in its bottom wall that lines up with the cell below it, so
 // the maze can grow from there.
-function makeFirstFloor(cells) {
+function makeFirstFloor(cells) { return makeSafeFloor(cells, false); }
+
+// A floor with the safe room at its centre (floor 1, and every SAFE_EVERY
+// floors after). Below floor 1 the safe room also has the stairs back up.
+function makeSafeFloor(cells, withUpStairs) {
   const n = cells || FLOOR_CELLS;                        // odd, at least 9
   const room = makeFloorGrid(n, n);
   const c = Math.floor(n / 2);                           // centre cell
@@ -293,7 +302,64 @@ function makeFirstFloor(cells) {
   room.healTile = { tx: mid, ty: fy0 - 1 };
   room.door = { tx: mid, ty: doorY };
   room.spawn = { x: ((fx0 + fx1 + 1) / 2) * TILE, y: ((fy0 + fy1 + 1) / 2) * TILE }; // pixel centre
+  if (withUpStairs) {
+    const ux = fx0 + 2, uy = fy0 + 2;
+    setTile(room, ux, uy, STAIRS_UP); setTile(room, ux + 1, uy, STAIRS_UP);
+    room.upStairs = { tiles: [[ux, uy], [ux + 1, uy]], spawn: { x: (ux + 1) * TILE, y: (uy + 0.5) * TILE } };
+  }
+  room.safe = true;
+  room.buildable = room.cellsW * room.cellsH - 42;      // everything but the safe room's 7x6 block
   return room;
+}
+
+// A plain floor: a small landing at the centre with the stairs back up, and
+// the maze grows out from there.
+function makePlainFloor(game, cells) {
+  const n = cells;
+  const room = makeFloorGrid(n, n);
+  initCells(room);
+  room.buildable = n * n;
+  const c = Math.floor(n / 2);
+  const prev = game.room;
+  game.room = room;
+  markBuilt(room, c, c);
+  const ux = c * CELL + 1, uy = c * CELL + 1;
+  setTile(room, ux, uy, STAIRS_UP); setTile(room, ux + 1, uy, STAIRS_UP);
+  room.upStairs = { tiles: [[ux, uy], [ux + 1, uy]], spawn: { x: (ux + 1) * TILE, y: (uy + 0.5) * TILE } };
+  room.spawn = room.upStairs.spawn;
+  const openable = decideSides(game, c, c);
+  keepReachable(game, c, c, openable);
+  if (room.frontier.length === 0) {           // always at least one way out of the landing
+    const d = DIRS[Math.floor(game.rng() * 4)], nb = neighbour(room, c, c, d);
+    setEdge(room, c, c, d, EDGE_OPEN);
+    claim(room, nb.cx, nb.cy, c, c, d);
+  }
+  wallUpAround(room, c, c);
+  game.room = prev;
+  return room;
+}
+
+// The exit: after each new piece of maze, roll X = (e^(k f) - 1) / (e^k - 1).
+// X stays small for most of the floor and reaches 100% as the last of it is built.
+function exitChance(f) {
+  return (Math.exp(EXIT_K * f) - 1) / (Math.exp(EXIT_K) - 1);
+}
+
+function maybePlaceExit(game, block, roomPlan) {
+  const room = game.room;
+  if (room.exit || !room.buildable) return;
+  const f = Math.min(1, room.builtCount / room.buildable);
+  if (f < 1 && game.rng() >= exitChance(f)) return;
+  let tx, ty;
+  if (roomPlan) {                     // in a room: the middle of the room
+    tx = Math.floor((roomPlan.rect.x0 + roomPlan.rect.x1) / 2);
+    ty = Math.floor((roomPlan.rect.y0 + roomPlan.rect.y1) / 2);
+  } else {                            // in a corridor cell: its top row
+    tx = block[0][0] * CELL + 1;
+    ty = block[0][1] * CELL + 1;
+  }
+  setTile(room, tx, ty, STAIRS_DOWN); setTile(room, tx + 1, ty, STAIRS_DOWN);
+  room.exit = { tiles: [[tx, ty], [tx + 1, ty]], spawn: { x: (tx + 1) * TILE, y: (ty + 0.5) * TILE }, atBuilt: room.builtCount };
 }
 
 // ---------- Maze generation ----------
@@ -482,6 +548,8 @@ function buildCell(game, entry) {
   for (const [x, y] of block) carveOpenEdges(room, x, y);
   if (roomPlan) addRoom(game, roomPlan);
   else if (block.length > 1) room.wideHalls.push(block);
+  if (roomPlan) roomPlan.rect = room.rooms[room.rooms.length - 1].rect;
+  maybePlaceExit(game, block, roomPlan);
 
   const openable = [];
   for (const [x, y] of block) {
@@ -1198,10 +1266,15 @@ function playerAttacks(game) {
 // opts.skeletons === false: no skeleton waves in the arena (used by movement tests)
 function makeGame(seed, opts) {
   const area = (opts && opts.area) || "maze";
-  const floorCells = (opts && opts.floorCells) || FLOOR_CELLS; // opts.floorCells: smaller floors for tests
-  const room = area === "maze" ? makeFirstFloor(floorCells) : makeRoom(ROOM_W, ROOM_H);
+  const fixedCells = (opts && opts.floorCells) || null; // opts.floorCells: every floor this size (tests)
+  const rng = makeRng(seed === undefined ? 1 : seed);
+  const firstCells = fixedCells || randomFloorCells(rng);
+  const room = area === "maze" ? makeFirstFloor(firstCells) : makeRoom(ROOM_W, ROOM_H);
   const game = {
-    floorCells,
+    floorCells: fixedCells,
+    floors: new Map(),     // floor number -> floor (every floor visited stays as explored)
+    checkpointFloor: 1,    // the most recent safe-room floor reached
+    stairsLock: false,     // true while standing on the stairs you just arrived on
     enemies: !(opts && opts.enemies === false), // opts.enemies === false: rooms stay empty (tests)
     flow: null,
     flowT: 0,
@@ -1209,13 +1282,13 @@ function makeGame(seed, opts) {
     room,
     player: makePlayer(room),
     floorNum: 1,           // current maze floor
-    deepestFloor: 0,       // deepest maze floor reached (picks the NPC's lines)
+    deepestFloor: 1,       // deepest maze floor reached (picks the Old Man's lines)
     npcTalking: false,     // player is near the NPC right now
     npcLine: -1,           // index into the current line group
     healTimer: 0,
     skeletons: [],
     effects: [],
-    rng: makeRng(seed === undefined ? 1 : seed),
+    rng,
     nextId: 1,
     kills: 0,
     waveTimer: 0,
@@ -1224,25 +1297,67 @@ function makeGame(seed, opts) {
     difficulty: (opts && opts.difficulty) || 0, // skeleton difficulty for new waves (testing keys 1-5)
   };
   if (game.waves && area === "arena") spawnWave(game, WAVE_SIZE);
+  game.floors.set(1, room);
   game.mazeRoom = area === "maze" ? room : null;
   if (area === "maze") { growMaze(game); computeVisibility(game); }
   return game;
 }
 
-// Back to the checkpoint (the safe room) after dying: full health, the floor
-// stays exactly as explored, and every room's skeletons are back.
-function respawnAtCheckpoint(game) {
-  if (!game.mazeRoom) game.mazeRoom = makeFirstFloor(game.floorCells);
+function randomFloorCells(rng) {
+  const steps = (FLOOR_MAX_CELLS - FLOOR_MIN_CELLS) / 2 + 1;
+  return FLOOR_MIN_CELLS + 2 * Math.floor(rng() * steps);
+}
+
+function isSafeFloorNum(n) { return (n - 1) % SAFE_EVERY === 0; }
+
+// Go to floor n. via: "down" (arrive at its stairs up), "up" (arrive at its
+// stairs down) or "checkpoint" (arrive in its safe room). Floors are made the
+// first time you reach them and kept after that; skeletons respawn on arrival.
+function enterFloor(game, n, via) {
+  game.floorNum = n;
+  let room = game.floors.get(n);
+  if (!room) {
+    const cells = game.floorCells || randomFloorCells(game.rng);
+    room = isSafeFloorNum(n) ? makeSafeFloor(cells, n > 1) : makePlainFloor(game, cells);
+    game.floors.set(n, room);
+  }
   game.area = "maze";
-  game.room = game.mazeRoom;
-  game.player = makePlayer(game.room);
-  game.over = false;
+  game.room = game.mazeRoom = room;
+  const hp = game.player ? game.player.hp : PLAYER_MAX_HP;
+  game.player = makePlayer(room);
+  game.player.hp = hp;
+  const at = via === "down" ? room.upStairs.spawn : via === "up" ? room.exit.spawn : room.spawn;
+  game.player.x = at.x - PLAYER_SIZE / 2;
+  game.player.y = at.y - PLAYER_SIZE / 2;
+  game.stairsLock = true;
   game.effects = [];
   game.npcTalking = false;
+  game.flow = null;
   game.skeletons = [];
-  for (const r of game.room.rooms) for (const sp of r.spawns) game.skeletons.push(skeletonFromSpawn(game, sp, r));
+  for (const r of room.rooms) for (const sp of r.spawns) game.skeletons.push(skeletonFromSpawn(game, sp, r));
+  game.deepestFloor = Math.max(game.deepestFloor, n);
+  if (room.safe) game.checkpointFloor = Math.max(game.checkpointFloor, n);
   growMaze(game);
   computeVisibility(game);
+}
+
+// Back to the checkpoint (the latest safe room) after dying: full health,
+// floors stay exactly as explored, and skeletons are back.
+function respawnAtCheckpoint(game) {
+  game.over = false;
+  enterFloor(game, game.checkpointFloor, "checkpoint");
+  game.player.hp = PLAYER_MAX_HP;
+}
+
+// Walking onto stairs takes you down or up. You arrive standing on the other
+// end's stairs; they don't take you anywhere until you step off and back on.
+function checkStairs(game) {
+  const t = playerTileUnderCenter(game);
+  if (t !== STAIRS_DOWN && t !== STAIRS_UP) { game.stairsLock = false; return false; }
+  if (game.stairsLock) return false;
+  if (t === STAIRS_DOWN) enterFloor(game, game.floorNum + 1, "down");
+  else enterFloor(game, game.floorNum - 1, "up");
+  return true;
 }
 
 // Testing: hop between the maze and the arena (key T). Keeps your HP. Coming
@@ -1317,6 +1432,7 @@ function stepGame(game, input, dt) {
   }
   updatePlayer(game.room, game.player, input, dt);
   if (game.area === "maze") {
+    if (checkStairs(game)) return;
     updateSafeRoom(game, dt);
     growMaze(game);
     computeVisibility(game);
@@ -1373,6 +1489,17 @@ function drawRoom(ctx, room, cam) {
       } else if (t === HEAL) {
         ctx.fillStyle = (tx + ty) % 2 === 0 ? "#3fbf9f" : "#47c9a8";
         ctx.fillRect(px, py, TILE, TILE);
+      } else if (t === STAIRS_DOWN || t === STAIRS_UP) {
+        // Steps: bands getting darker going down, lighter going up.
+        const down = t === STAIRS_DOWN;
+        for (let i = 0; i < 4; i++) {
+          const k = down ? i : 3 - i;
+          const v = 92 - k * 20;
+          ctx.fillStyle = `rgb(${v}, ${v - 8}, ${v - 18})`;
+          ctx.fillRect(px, py + i * 8, TILE, 8);
+          ctx.fillStyle = `rgba(0, 0, 0, 0.35)`;
+          ctx.fillRect(px, py + i * 8 + 6, TILE, 2);
+        }
       } else if (t === DOOR) {
         // Open doorway: worn stone threshold.
         ctx.fillStyle = "#3a332b";
@@ -1611,7 +1738,19 @@ function drawHud(ctx, game) {
   ctx.font = "14px monospace";
   ctx.textAlign = "right";
   if (game.area === "arena") ctx.fillText("Skeletons slain: " + game.kills, VIEW_W - 12, 21);
-  else ctx.fillText("Floor " + game.floorNum + (inSafeRoom(game) ? "  \u00b7  Safe room" : ""), VIEW_W - 12, 21);
+  else {
+    ctx.fillText("Floor " + game.floorNum + (inSafeRoom(game) ? "  \u00b7  Safe room" : ""), VIEW_W - 12, 21);
+    // Testing readout: how much of the floor exists, and the current exit chance.
+    const r = game.room;
+    if (r.buildable) {
+      const f = Math.min(1, r.builtCount / r.buildable);
+      ctx.font = "11px monospace";
+      ctx.fillStyle = "#8a8276";
+      ctx.fillText("built " + Math.round(f * 100) + "%  \u00b7  " +
+        (r.exit ? "exit is out there" : "exit chance " + (exitChance(f) * 100).toFixed(1) + "%") +
+        "  \u00b7  checkpoint F" + game.checkpointFloor, VIEW_W - 12, 38);
+    }
+  }
   ctx.textAlign = "center";
   ctx.fillStyle = "#9c9486";
   ctx.font = "12px monospace";
