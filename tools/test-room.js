@@ -16,7 +16,7 @@ function loadGame() {
   vm.runInContext(
     m[1] + "\n;this.__api = { TILE, ROOM_W, ROOM_H, STEP, PLAYER_SPEED, WALL, FLOOR, makeGame, stepGame, tileAt, boxHitsWall," +
       " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER, FACING_LOCK_EXTRA, CHAIN_GRACE," +
-      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKEL_HP, SKEL_AGGRO_RANGE, SKEL_LEASH_RANGE, SKEL_WINDUP, SKEL_STUN, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng };",
+      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng };",
     ctx
   );
   return ctx.__api;
@@ -208,7 +208,7 @@ console.log("Skeletons: getting hit");
 {
   const { g, sk } = withSkeleton(34, 0);   // just right of the player, in reach
   swingAt(g, 1, 0);
-  check("one sword hit takes 1 HP", sk.hp === G.SKEL_HP - 1, "hp=" + sk.hp);
+  check("one sword hit takes 1 HP", sk.hp === G.SKELETON_EASY.hp - 1, "hp=" + sk.hp);
   check("hit skeleton is knocked back", sk.x > g.player.x + 34);
   // Walk back into reach and finish it.
   g.player.x = sk.x - 34; g.player.y = sk.y;
@@ -225,13 +225,45 @@ console.log("Skeletons: getting hit");
     wasWinding && w.g.player.hp === G.PLAYER_MAX_HP, "winding=" + wasWinding + " hp=" + w.g.player.hp);
 }
 
+console.log("Skeletons: difficulty profiles");
+{
+  const E = G.SKELETON_EASY;
+  const mid = G.skeletonStats(0.5), lo = G.skeletonStats(0), hi = G.skeletonStats(1);
+  let blendOk = true;
+  for (const k of Object.keys(E)) {
+    if (k === "hp") continue;
+    const want = (G.SKELETON_EASY[k] + G.SKELETON_HARD[k]) / 2;
+    if (Math.abs(mid[k] - want) > 1e-9) blendOk = false;
+  }
+  check("difficulty 0.5 is halfway between easy and hard", blendOk);
+  check("difficulty 0 = easy, 1 = hard", lo.speed === E.speed && hi.speed === G.SKELETON_HARD.speed);
+  check("hp is a whole number", Number.isInteger(G.skeletonStats(0.37).hp));
+  check("easy skeleton swing is shorter and narrower than the player's",
+    E.swingReach < G.SWING_REACH && E.swingArc < G.SWING_ARC);
+  check("easy skeleton only attacks when its blade can reach",
+    E.attackRange <= E.swingReach + 11);   // 11 = half the player's body
+
+  // Its swing reaches a player right in front, but not one just past its reach.
+  function skeletonSwingHits(gap) {
+    const { g, sk } = withSkeleton(0, 0);
+    sk.x = g.player.x + 22 + gap; sk.y = g.player.y;   // player is to its left
+    sk.aggro = true; sk.cooldown = 0;
+    sk.windup = 0.0001; sk.windupAngle = Math.PI;
+    G.stepGame(g, none, G.STEP);
+    run(g, none, E.swingTime + G.STEP);
+    return g.player.hp < G.PLAYER_MAX_HP;
+  }
+  check("easy swing hits a player standing close", skeletonSwingHits(6));
+  check("easy swing misses a player just past its reach", !skeletonSwingHits(E.swingReach - 8));
+}
+
 console.log("Skeletons: aggro");
 {
-  const far = withSkeleton(G.SKEL_AGGRO_RANGE + 60, 0);
+  const far = withSkeleton(G.SKELETON_EASY.aggroRange + 60, 0);
   run(far.g, none, 2);
   check("stays calm when the player is out of range", !far.sk.aggro);
 
-  const near = withSkeleton(G.SKEL_AGGRO_RANGE - 40, 0);
+  const near = withSkeleton(G.SKELETON_EASY.aggroRange - 40, 0);
   G.stepGame(near.g, none, G.STEP);
   check("notices the player in range", near.sk.aggro);
 
@@ -250,7 +282,7 @@ console.log("Skeletons: attacking the player");
     if (firstHit === null && g.player.hp < G.PLAYER_MAX_HP) firstHit = i * G.STEP;
   }
   check("chases and hits a player standing still", firstHit !== null, "never hit");
-  check("first hit takes a moment (approach + wind-up)", firstHit !== null && firstHit > G.SKEL_WINDUP,
+  check("first hit takes a moment (approach + wind-up)", firstHit !== null && firstHit > G.SKELETON_EASY.windup,
     "t=" + (firstHit === null ? "-" : firstHit.toFixed(2)));
 
   const one = withSkeleton(150, 0);

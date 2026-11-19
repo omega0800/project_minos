@@ -49,17 +49,37 @@ const KNOCKBACK_TIME = 0.12;      // knockback slows to a stop over this long
 const HIT_FLASH = 0.12;           // white flash when hit
 
 // Skeletons
+// Every skeleton has a difficulty from 0 (max easy) to 1 (max hard). Each stat
+// is blended between the two profiles below, so skeletons can sit anywhere on
+// that continuum. HP is rounded to a whole number of hits.
 const SKEL_SIZE = PLAYER_SIZE;    // same body as the player
-const SKEL_HP = 2;                // sword hits to kill
-const SKEL_SPEED = 110;           // chase speed (player is 180)
-const SKEL_WANDER_SPEED = 40;     // idle wandering speed
-const SKEL_AGGRO_RANGE = 220;     // notices the player within this distance (center to center)
-const SKEL_LEASH_RANGE = 380;     // gives up the chase beyond this distance
-const SKEL_ATTACK_RANGE = 46;     // starts an attack when this close (center to center)
-const SKEL_STOP_RANGE = 30;       // doesn't walk closer than this
-const SKEL_WINDUP = 0.35;         // telegraph before a skeleton swings
-const SKEL_COOLDOWN = 0.7;        // pause after a skeleton's swing
-const SKEL_STUN = 0.3;            // a hit skeleton can't act for this long (cancels its attack)
+const SKELETON_EASY = {
+  hp: 2,                  // sword hits to kill
+  speed: 110,             // chase speed, px/s (player is 180)
+  wanderSpeed: 40,        // idle wandering speed
+  aggroRange: 220,        // notices the player within this distance (center to center)
+  leashRange: 380,        // gives up the chase beyond this distance
+  attackRange: 38,        // starts an attack when this close (center to center)
+  stopRange: 30,          // doesn't walk closer than this
+  windup: 0.35,           // telegraph before swinging, s
+  cooldown: 0.7,          // pause after a swing, s
+  stun: 0.3,              // can't act this long after being hit (cancels its attack), s
+  swingTime: 0.198,       // same swing speed as the player
+  swingArc: Math.PI / 2,  // 90 degrees (player: 120)
+  swingReach: 32,         // px from center (player: 40)
+};
+// Placeholder: identical to easy until max-hard is designed.
+const SKELETON_HARD = Object.assign({}, SKELETON_EASY);
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function skeletonStats(difficulty) {
+  const t = Math.max(0, Math.min(1, difficulty));
+  const out = {};
+  for (const k of Object.keys(SKELETON_EASY)) out[k] = lerp(SKELETON_EASY[k], SKELETON_HARD[k], t);
+  out.hp = Math.round(out.hp);
+  return out;
+}
 
 // Room waves (for testing combat in a single room)
 const WAVE_SIZE = 3;
@@ -159,15 +179,16 @@ function distBetween(a, b) {
 // ============================================================
 // Shared body pieces: swing, knockback, getting hit
 // ============================================================
-function newSwing(angle) {
-  return { t: 0, angle, hit: new Set() }; // hit = ids already struck this swing
+// A swing carries its own shape, so player and skeleton swings can differ.
+function newSwing(angle, arc, reach, time) {
+  return { t: 0, angle, arc, reach, time, hit: new Set() }; // hit = ids already struck this swing
 }
 
 // Current blade angle during a swing: sweeps across the arc, easing out.
 function bladeAngle(swing) {
-  const u = Math.min(1, swing.t / SWING_TIME);
+  const u = Math.min(1, swing.t / swing.time);
   const eased = 1 - (1 - u) * (1 - u);
-  return swing.angle - SWING_ARC / 2 + SWING_ARC * eased;
+  return swing.angle - swing.arc / 2 + swing.arc * eased;
 }
 
 // Is any part of the box within reach of the blade's path so far?
@@ -177,12 +198,12 @@ function swingTouches(swinger, box) {
   if (!s) return false;
   const cx = swinger.x + swinger.size / 2;
   const cy = swinger.y + swinger.size / 2;
-  const a0 = s.angle - SWING_ARC / 2;
+  const a0 = s.angle - s.arc / 2;
   const a1 = bladeAngle(s);
   const steps = 12;
   for (let i = 0; i <= steps; i++) {
     const a = a0 + (a1 - a0) * (i / steps);
-    for (let r = swinger.size / 2; r <= SWING_REACH; r += 6) {
+    for (let r = swinger.size / 2; r <= s.reach; r += 6) {
       const px = cx + Math.cos(a) * r;
       const py = cy + Math.sin(a) * r;
       if (px >= box.x && px <= box.x + box.size && py >= box.y && py <= box.y + box.size) return true;
@@ -279,7 +300,7 @@ function updatePlayer(room, player, input, dt) {
       player.facing = { x: Math.cos(angle), y: Math.sin(angle) };
       player.chainAngle = null;
     }
-    player.swing = newSwing(angle); // angle locked at swing start
+    player.swing = newSwing(angle, SWING_ARC, SWING_REACH, SWING_TIME); // angle locked at swing start
   }
 
   // --- Movement ---
@@ -306,12 +327,15 @@ function updatePlayer(room, player, input, dt) {
 // Simple brain: idle (wander) until the player comes close, then chase and
 // attack. Attacks are telegraphed by a short wind-up; hitting a skeleton
 // during its wind-up or swing cancels the attack.
-function makeSkeleton(id, x, y, rng) {
+function makeSkeleton(id, x, y, rng, difficulty) {
+  const stats = skeletonStats(difficulty || 0);
   return {
     id,
     x, y,
     size: SKEL_SIZE,
-    hp: SKEL_HP,
+    difficulty: difficulty || 0,
+    stats,
+    hp: stats.hp,
     flash: 0,
     knock: null,
     facing: { x: 0, y: 1 },
@@ -327,7 +351,7 @@ function makeSkeleton(id, x, y, rng) {
 }
 
 function updateSkeleton(game, sk, dt) {
-  const room = game.room, p = game.player, rng = game.rng;
+  const room = game.room, p = game.player, rng = game.rng, st = sk.stats;
   if (sk.flash > 0) sk.flash = Math.max(0, sk.flash - dt);
   if (sk.cooldown > 0) sk.cooldown = Math.max(0, sk.cooldown - dt);
   applyKnockback(room, sk, dt);
@@ -335,8 +359,8 @@ function updateSkeleton(game, sk, dt) {
 
   const d = distBetween(sk, p);
   const playerAlive = !game.over;
-  if (!sk.aggro && playerAlive && d <= SKEL_AGGRO_RANGE) sk.aggro = true;
-  if (sk.aggro && (!playerAlive || d > SKEL_LEASH_RANGE)) sk.aggro = false;
+  if (!sk.aggro && playerAlive && d <= st.aggroRange) sk.aggro = true;
+  if (sk.aggro && (!playerAlive || d > st.leashRange)) sk.aggro = false;
 
   // Swinging
   if (sk.swing) {
@@ -345,9 +369,9 @@ function updateSkeleton(game, sk, dt) {
       sk.swing.hit.add(p.id);
       hurtPlayer(game, sk);
     }
-    if (sk.swing.t >= SWING_TIME) {
+    if (sk.swing.t >= sk.swing.time) {
       sk.swing = null;
-      sk.cooldown = SKEL_COOLDOWN;
+      sk.cooldown = st.cooldown;
     }
     return; // stands still while swinging
   }
@@ -355,7 +379,7 @@ function updateSkeleton(game, sk, dt) {
   // Winding up
   if (sk.windup > 0) {
     sk.windup = Math.max(0, sk.windup - dt);
-    if (sk.windup === 0) sk.swing = newSwing(sk.windupAngle);
+    if (sk.windup === 0) sk.swing = newSwing(sk.windupAngle, st.swingArc, st.swingReach, st.swingTime);
     return;
   }
 
@@ -364,12 +388,12 @@ function updateSkeleton(game, sk, dt) {
     const ax = pc.x - sc.x, ay = pc.y - sc.y;
     const len = Math.hypot(ax, ay) || 1;
     sk.facing = { x: ax / len, y: ay / len };
-    if (d <= SKEL_ATTACK_RANGE && sk.cooldown === 0) {
-      sk.windup = SKEL_WINDUP;
+    if (d <= st.attackRange && sk.cooldown === 0) {
+      sk.windup = st.windup;
       sk.windupAngle = Math.atan2(ay, ax);
-    } else if (d > SKEL_STOP_RANGE) {
-      moveAxis(room, sk, sk.facing.x * SKEL_SPEED * dt, 0);
-      moveAxis(room, sk, 0, sk.facing.y * SKEL_SPEED * dt);
+    } else if (d > st.stopRange) {
+      moveAxis(room, sk, sk.facing.x * st.speed * dt, 0);
+      moveAxis(room, sk, 0, sk.facing.y * st.speed * dt);
     }
   } else {
     // Wander: alternate between short strolls and standing around.
@@ -385,8 +409,8 @@ function updateSkeleton(game, sk, dt) {
       sk.wanderT = 0.8 + rng() * 1.6;
     }
     if (sk.wanderDir) {
-      moveAxis(room, sk, sk.wanderDir.x * SKEL_WANDER_SPEED * dt, 0);
-      moveAxis(room, sk, 0, sk.wanderDir.y * SKEL_WANDER_SPEED * dt);
+      moveAxis(room, sk, sk.wanderDir.x * st.wanderSpeed * dt, 0);
+      moveAxis(room, sk, 0, sk.wanderDir.y * st.wanderSpeed * dt);
     }
   }
 }
@@ -451,7 +475,7 @@ function playerAttacks(game) {
     p.swing.hit.add(sk.id); // one hit per swing per target
     sk.hp -= 1;
     sk.flash = HIT_FLASH;
-    sk.stun = SKEL_STUN;
+    sk.stun = sk.stats.stun;
     sk.aggro = true;
     sk.windup = 0;          // interrupt its attack
     sk.swing = null;
@@ -568,20 +592,20 @@ function drawSkeleton(ctx, sk) {
   }
   // Wind-up telegraph: blade drawn back, glowing brighter as the swing nears.
   if (sk.windup > 0) {
-    const k = 1 - sk.windup / SKEL_WINDUP;
-    const a = sk.windupAngle - SWING_ARC / 2 - 0.5;
+    const k = 1 - sk.windup / sk.stats.windup;
+    const a = sk.windupAngle - sk.stats.swingArc / 2 - 0.5;
     ctx.strokeStyle = `rgba(255, 120, 90, ${0.35 + 0.65 * k})`;
     ctx.lineWidth = 4;
     ctx.lineCap = "round";
     ctx.beginPath();
     ctx.moveTo(cx + Math.cos(a) * (sk.size / 2), cy + Math.sin(a) * (sk.size / 2));
-    ctx.lineTo(cx + Math.cos(a) * SWING_REACH, cy + Math.sin(a) * SWING_REACH);
+    ctx.lineTo(cx + Math.cos(a) * sk.stats.swingReach, cy + Math.sin(a) * sk.stats.swingReach);
     ctx.stroke();
     ctx.lineCap = "butt";
   }
   // Health pips (only once damaged)
-  if (sk.hp < SKEL_HP) {
-    for (let i = 0; i < SKEL_HP; i++) {
+  if (sk.hp < sk.stats.hp) {
+    for (let i = 0; i < sk.stats.hp; i++) {
       ctx.fillStyle = i < sk.hp ? "#d0342c" : "#3a2a28";
       ctx.fillRect(sk.x + i * 7, sk.y - 7, 5, 3);
     }
@@ -593,13 +617,13 @@ function drawSwing(ctx, ent, trail, blade) {
   if (!s) return;
   const cx = ent.x + ent.size / 2;
   const cy = ent.y + ent.size / 2;
-  const a0 = s.angle - SWING_ARC / 2;
+  const a0 = s.angle - s.arc / 2;
   const a = bladeAngle(s);
   // Faint trail over the part of the arc already swept
   ctx.fillStyle = trail;
   ctx.beginPath();
   ctx.moveTo(cx, cy);
-  ctx.arc(cx, cy, SWING_REACH, a0, a);
+  ctx.arc(cx, cy, s.reach, a0, a);
   ctx.closePath();
   ctx.fill();
   // Blade
@@ -608,7 +632,7 @@ function drawSwing(ctx, ent, trail, blade) {
   ctx.lineCap = "round";
   ctx.beginPath();
   ctx.moveTo(cx + Math.cos(a) * (ent.size / 2), cy + Math.sin(a) * (ent.size / 2));
-  ctx.lineTo(cx + Math.cos(a) * SWING_REACH, cy + Math.sin(a) * SWING_REACH);
+  ctx.lineTo(cx + Math.cos(a) * s.reach, cy + Math.sin(a) * s.reach);
   ctx.stroke();
   ctx.lineCap = "butt";
 }
