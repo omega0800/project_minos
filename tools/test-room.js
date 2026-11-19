@@ -16,7 +16,7 @@ function loadGame() {
   vm.runInContext(
     m[1] + "\n;this.__api = { TILE, ROOM_W, ROOM_H, STEP, PLAYER_SPEED, WALL, FLOOR, makeGame, stepGame, tileAt, boxHitsWall," +
       " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER, FACING_LOCK_EXTRA, CHAIN_GRACE," +
-      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED };",
+      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED, makeSafeRoom, switchArea, HEAL, DOOR, NPC, VOID, HEAL_INTERVAL, NPC_TALK_RANGE, NPC_LINES };",
     ctx
   );
   return ctx.__api;
@@ -278,7 +278,7 @@ console.log("Skeletons: difficulty profiles");
   const te = timeToFirstHit(0), th = timeToFirstHit(1);
   check("hard skeleton lands its first hit much sooner (" + te.toFixed(2) + " s vs " + th.toFixed(2) + " s)", th < te * 0.6);
 
-  const g = G.makeGame(3);
+  const g = G.makeGame(3, { area: "arena" });
   G.setDifficulty(g, 1);
   check("setDifficulty respawns the wave at that difficulty",
     g.skeletons.length === G.WAVE_SIZE && g.skeletons.every((sk) => sk.difficulty === 1));
@@ -331,7 +331,7 @@ console.log("Death and waves");
   run(g, hold({ right: true }), 0.5);
   check("dead player can't move", g.player.x === px);
 
-  const w = G.makeGame(7);
+  const w = G.makeGame(7, { area: "arena" });
   check("room starts with a full wave", w.skeletons.length === G.WAVE_SIZE, "n=" + w.skeletons.length);
   const minD = Math.min(...w.skeletons.map((s) => Math.hypot(s.x - w.player.x, s.y - w.player.y)));
   check("wave spawns away from the player", minD > 200, "closest=" + minD.toFixed(0));
@@ -345,7 +345,7 @@ console.log("Long fight simulation");
   // A scrappy bot: walks toward the nearest skeleton and swings when close.
   let wallBreak = false, deaths = 0, kills = 0, steps = 0;
   for (const seed of [1, 2, 3, 4, 5]) {
-    const g = G.makeGame(seed);
+    const g = G.makeGame(seed, { area: "arena" });
     for (let i = 0; i < Math.round(60 / G.STEP); i++) {
       steps++;
       let inp = Object.assign({}, none);
@@ -374,7 +374,81 @@ console.log("Long fight simulation");
   check("the bot kills skeletons (" + kills + " kills, " + deaths + " deaths in 5 runs)", kills > 0);
 }
 
-function makeFresh() { return G.makeGame(1, { skeletons: false }); }
+console.log("Safe room");
+{
+  const g = G.makeGame(1);
+  check("game starts in the safe room", g.area === "safe");
+  check("no skeletons in the safe room", g.skeletons.length === 0);
+  check("player starts on open floor", !G.boxHitsWall(g.room, g.player.x, g.player.y, g.player.size));
+  run(g, none, G.WAVE_DELAY * 3);
+  check("no waves spawn in the safe room", g.skeletons.length === 0);
+
+  // Long random walk stays inside the room (never in a wall, void, door or NPC).
+  let seed = 99, bad = false;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  let inp = none;
+  for (let i = 0; i < 20000; i++) {
+    if (i % 30 === 0) inp = { up: rnd() < 0.5, down: rnd() < 0.5, left: rnd() < 0.5, right: rnd() < 0.5 };
+    G.stepGame(g, inp, G.STEP);
+    if (G.boxHitsWall(g.room, g.player.x, g.player.y, g.player.size)) { bad = true; break; }
+  }
+  check("20,000 random steps: never leaves the room or walks through the NPC", !bad);
+
+  // Healing nook
+  const h = G.makeGame(1);
+  h.player.hp = 1;
+  h.player.x = 14 * G.TILE + 5; h.player.y = 2 * G.TILE + 5;   // stand in the nook
+  check("nook tiles are heal tiles", G.tileAt(h.room, 14, 2) === G.HEAL && G.tileAt(h.room, 15, 3) === G.HEAL);
+  run(h, none, G.HEAL_INTERVAL * 2 + 0.05);
+  check("standing on green heals 1 HP per interval", h.player.hp === 3, "hp=" + h.player.hp);
+  run(h, none, 10);
+  check("healing stops at max HP", h.player.hp === G.PLAYER_MAX_HP);
+  const off = G.makeGame(1);
+  off.player.hp = 2;
+  run(off, none, 3);
+  check("no healing off the green", off.player.hp === 2);
+
+  // Walking up into the nook from the room works.
+  const walk = G.makeGame(1);
+  walk.player.hp = 2;
+  run(walk, hold({ up: true }), 3);
+  check("can walk from the start straight up into the nook", G.tileAt(walk.room, Math.floor((walk.player.x + 11) / G.TILE), Math.floor((walk.player.y + 11) / G.TILE)) === G.HEAL);
+
+  // Door
+  const d = G.makeGame(1);
+  run(d, hold({ down: true }), 3);
+  check("door blocks the player", d.player.y + d.player.size <= 16 * G.TILE);
+  check("bumping the door shows the message", d.doorMsg > 0);
+  run(d, hold({ up: true }), 3);
+  check("message fades after walking away", d.doorMsg === 0);
+
+  // NPC
+  const n = G.makeGame(1);
+  run(n, none, 0.2);
+  check("NPC quiet when the player is far", !n.npcTalking);
+  n.player.x = 18 * G.TILE + 2; n.player.y = 8 * G.TILE + 5;  // just left of him
+  G.stepGame(n, none, G.STEP);
+  check("NPC talks when the player is close", n.npcTalking && n.npcLine === 0);
+  n.player.x = 8 * G.TILE; n.player.y = 12 * G.TILE;
+  G.stepGame(n, none, G.STEP);
+  n.player.x = 18 * G.TILE + 2; n.player.y = 8 * G.TILE + 5;
+  G.stepGame(n, none, G.STEP);
+  check("walking up again gives the next line", n.npcLine === 1);
+  n.deepestFloor = 6;
+  n.player.x = 8 * G.TILE; G.stepGame(n, none, G.STEP);
+  n.player.x = 18 * G.TILE + 2; G.stepGame(n, none, G.STEP);
+  check("deeper floors switch to deeper lines", G.NPC_LINES[2].lines.length > 0 && n.npcTalking);
+
+  // Arena hop keeps HP; death goes back to the safe room is handled by the R key in the browser.
+  const t = G.makeGame(1);
+  t.player.hp = 3;
+  G.switchArea(t);
+  check("T: arena has skeletons and keeps your HP", t.area === "arena" && t.skeletons.length === G.WAVE_SIZE && t.player.hp === 3);
+  G.switchArea(t);
+  check("T again: back in the safe room, still 3 HP, no skeletons", t.area === "safe" && t.player.hp === 3 && t.skeletons.length === 0);
+}
+
+function makeFresh() { return G.makeGame(1, { area: "arena", skeletons: false }); }
 
 console.log(failures === 0 ? "\nAll tests passed." : "\n" + failures + " test(s) FAILED.");
 process.exit(failures === 0 ? 0 : 1);

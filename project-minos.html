@@ -100,6 +100,33 @@ const SPAWN_MIN_DIST = 250;       // skeletons spawn at least this far from the 
 // Tile types
 const FLOOR = 0;
 const WALL = 1;
+const VOID = 2;   // solid emptiness outside a room (drawn black)
+const HEAL = 3;   // aquamarine floor: standing on it heals
+const DOOR = 4;   // solid for now: the maze isn't built yet
+const NPC = 5;    // the tile the NPC stands on (solid)
+
+// Safe room
+const HEAL_INTERVAL = 0.5;        // seconds per 1 HP healed while on a heal tile
+const NPC_TALK_RANGE = 80;        // NPC speaks when the player is this close (center to center)
+const DOOR_MSG_TIME = 1.6;        // how long the "door won't open" message shows
+
+// What the NPC says. He picks from the deepest group the player has reached
+// (by deepest floor), and moves to a new line each time you walk up to him.
+const NPC_LINES = [
+  { minFloor: 0, lines: [
+    "Ah. Another one. Good. The maze needs walking.",
+    "Past that door the halls twist and turn. Somewhere there are stairs down. Find them.",
+    "Hurt? Stand in the green. It mends what the skeletons break.",
+    "Don't just stand there. The maze won't explore itself.",
+  ] },
+  { minFloor: 3, lines: [
+    "Still breathing? Then you're not deep enough yet.",
+    "The deeper halls remember who walks them. Keep going.",
+  ] },
+  { minFloor: 6, lines: [
+    "Few get this far. Fewer come back. Go on, then.",
+  ] },
+];
 
 // ============================================================
 // Random numbers (seeded, so tests are repeatable)
@@ -136,7 +163,32 @@ function tileAt(room, tx, ty) {
 }
 
 function isSolid(room, tx, ty) {
-  return tileAt(room, tx, ty) === WALL;
+  const t = tileAt(room, tx, ty);
+  return t === WALL || t === VOID || t === DOOR || t === NPC;
+}
+
+// The safe room: an 18x12 room in the middle of the screen, with a healing
+// nook set into the top wall, a 2-wide door in the bottom wall and the NPC.
+// Returned room also records where those things are.
+function makeSafeRoom() {
+  const w = ROOM_W, h = ROOM_H;
+  const tiles = new Uint8Array(w * h).fill(VOID);
+  const set = (x, y, t) => { tiles[y * w + x] = t; };
+  const x0 = 6, x1 = 23, y0 = 4, y1 = 15;            // floor area (inclusive)
+  for (let y = y0 - 1; y <= y1 + 1; y++)
+    for (let x = x0 - 1; x <= x1 + 1; x++)
+      set(x, y, x < x0 || x > x1 || y < y0 || y > y1 ? WALL : FLOOR);
+  // Healing nook: 4 wide, 2 deep, cut into the top wall, walls around it.
+  for (let y = 1; y <= 3; y++)
+    for (let x = 12; x <= 17; x++)
+      set(x, y, x === 12 || x === 17 || y === 1 ? WALL : HEAL);
+  // Door: 2 tiles wide (hallway width) in the bottom wall.
+  set(14, y1 + 1, DOOR);
+  set(15, y1 + 1, DOOR);
+  // NPC stands to the right of center.
+  const npc = { tx: 19, ty: 8 };
+  set(npc.tx, npc.ty, NPC);
+  return { w, h, tiles, npc };
 }
 
 // Does a box at (x, y) of the given size overlap any solid tile?
@@ -502,12 +554,22 @@ function playerAttacks(game) {
 // ============================================================
 // Game state
 // ============================================================
-// opts.skeletons === false: empty room (used by movement tests)
+// Areas: "safe" (the safe room, where the game starts) and "arena" (the
+// open room with skeleton waves, kept for testing combat until the maze exists).
+// opts.area: which area to start in (default "safe")
+// opts.skeletons === false: no skeleton waves in the arena (used by movement tests)
 function makeGame(seed, opts) {
-  const room = makeRoom(ROOM_W, ROOM_H);
+  const area = (opts && opts.area) || "safe";
+  const room = area === "safe" ? makeSafeRoom() : makeRoom(ROOM_W, ROOM_H);
   const game = {
+    area,
     room,
     player: makePlayer(room),
+    deepestFloor: 0,       // deepest maze floor reached (picks the NPC's lines)
+    npcTalking: false,     // player is near the NPC right now
+    npcLine: -1,           // index into the current line group
+    doorMsg: 0,            // >0 while "the door won't open" shows
+    healTimer: 0,
     skeletons: [],
     effects: [],
     rng: makeRng(seed === undefined ? 1 : seed),
@@ -518,8 +580,71 @@ function makeGame(seed, opts) {
     waves: !(opts && opts.skeletons === false),
     difficulty: (opts && opts.difficulty) || 0, // skeleton difficulty for new waves (testing keys 1-5)
   };
-  if (game.waves) spawnWave(game, WAVE_SIZE);
+  if (game.waves && area === "arena") spawnWave(game, WAVE_SIZE);
   return game;
+}
+
+// Testing: hop between the safe room and the arena (key T). Keeps your HP.
+function switchArea(game) {
+  const hp = game.player.hp;
+  game.area = game.area === "safe" ? "arena" : "safe";
+  game.room = game.area === "safe" ? makeSafeRoom() : makeRoom(ROOM_W, ROOM_H);
+  game.player = makePlayer(game.room);
+  game.player.hp = hp;
+  game.skeletons = [];
+  game.effects = [];
+  game.waveTimer = 0;
+  game.npcTalking = false;
+  game.doorMsg = 0;
+  if (game.area === "arena" && game.waves) spawnWave(game, WAVE_SIZE);
+}
+
+// ---------- Safe room behaviour ----------
+function playerTileUnderCenter(game) {
+  const c = centerOf(game.player);
+  return tileAt(game.room, Math.floor(c.x / TILE), Math.floor(c.y / TILE));
+}
+
+function npcLineGroup(game) {
+  let group = NPC_LINES[0];
+  for (const g of NPC_LINES) if (game.deepestFloor >= g.minFloor) group = g;
+  return group;
+}
+
+function updateSafeRoom(game, dt) {
+  const p = game.player, room = game.room;
+
+  // Healing nook
+  if (playerTileUnderCenter(game) === HEAL && p.hp < PLAYER_MAX_HP) {
+    game.healTimer += dt;
+    if (game.healTimer >= HEAL_INTERVAL) {
+      game.healTimer -= HEAL_INTERVAL;
+      p.hp += 1;
+      game.effects.push({ kind: "heal", x: p.x + p.size / 2, y: p.y, t: 0.6, max: 0.6 });
+    }
+  } else {
+    game.healTimer = 0;
+  }
+
+  // NPC: starts a new line each time you walk up to him.
+  if (room.npc) {
+    const npcBox = { x: room.npc.tx * TILE, y: room.npc.ty * TILE, size: TILE };
+    const near = distBetween(p, npcBox) <= NPC_TALK_RANGE;
+    if (near && !game.npcTalking) {
+      const lines = npcLineGroup(game).lines;
+      game.npcLine = (game.npcLine + 1) % lines.length;
+    }
+    game.npcTalking = near;
+  }
+
+  // Door: pushing against it shows a message.
+  if (game.doorMsg > 0) game.doorMsg = Math.max(0, game.doorMsg - dt);
+  const pad = 2; // touching = within 2 px
+  const x0 = Math.floor((p.x - pad) / TILE), x1 = Math.floor((p.x + p.size + pad) / TILE);
+  const y0 = Math.floor((p.y - pad) / TILE), y1 = Math.floor((p.y + p.size + pad) / TILE);
+  for (let ty = y0; ty <= y1; ty++)
+    for (let tx = x0; tx <= x1; tx++)
+      if (tileAt(room, tx, ty) === DOOR) game.doorMsg = DOOR_MSG_TIME;
 }
 
 // Testing helper: change skeleton difficulty and replace the current wave.
@@ -536,6 +661,7 @@ function stepGame(game, input, dt) {
     return;
   }
   updatePlayer(game.room, game.player, input, dt);
+  if (game.area === "safe") updateSafeRoom(game, dt);
   playerAttacks(game);
   for (const sk of game.skeletons) updateSkeleton(game, sk, dt);
   separateSkeletons(game, dt);
@@ -544,7 +670,7 @@ function stepGame(game, input, dt) {
   game.effects = game.effects.filter((e) => e.t > 0);
 
   // Next wave once the room is clear.
-  if (game.waves && game.skeletons.length === 0) {
+  if (game.area === "arena" && game.waves && game.skeletons.length === 0) {
     game.waveTimer += dt;
     if (game.waveTimer >= WAVE_DELAY) {
       game.waveTimer = 0;
@@ -566,6 +692,20 @@ function drawRoom(ctx, room) {
         ctx.fillRect(px, py, TILE, TILE);
         ctx.fillStyle = "#3a3a46";
         ctx.fillRect(px, py + TILE - 6, TILE, 6);
+      } else if (t === VOID) {
+        ctx.fillStyle = "#0b0a0c";
+        ctx.fillRect(px, py, TILE, TILE);
+      } else if (t === HEAL) {
+        ctx.fillStyle = (tx + ty) % 2 === 0 ? "#3fbf9f" : "#47c9a8";
+        ctx.fillRect(px, py, TILE, TILE);
+      } else if (t === DOOR) {
+        ctx.fillStyle = "#5c3d22";
+        ctx.fillRect(px, py, TILE, TILE);
+        ctx.fillStyle = "#47301b";
+        for (let i = 0; i < 4; i++) ctx.fillRect(px + 2 + i * 8, py + 2, 2, TILE - 4); // planks
+        ctx.fillStyle = "#2c2c34";
+        ctx.fillRect(px, py, TILE, 3);                                                // lintel
+        ctx.fillRect(px, py + 13, TILE, 3);                                           // iron band
       } else {
         // Subtle checker so movement is easy to see.
         ctx.fillStyle = (tx + ty) % 2 === 0 ? "#26221e" : "#2b2621";
@@ -573,6 +713,75 @@ function drawRoom(ctx, room) {
       }
     }
   }
+}
+
+// Soft shimmer over the heal tiles so the nook reads as special.
+function drawHealGlow(ctx, room, time) {
+  ctx.fillStyle = `rgba(160, 255, 230, ${0.08 + 0.06 * Math.sin(time * 2.5)})`;
+  for (let ty = 0; ty < room.h; ty++)
+    for (let tx = 0; tx < room.w; tx++)
+      if (tileAt(room, tx, ty) === HEAL) ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
+}
+
+function drawNpc(ctx, room) {
+  if (!room.npc) return;
+  const x = room.npc.tx * TILE, y = room.npc.ty * TILE;
+  // Floor under him
+  ctx.fillStyle = (room.npc.tx + room.npc.ty) % 2 === 0 ? "#26221e" : "#2b2621";
+  ctx.fillRect(x, y, TILE, TILE);
+  // Robe
+  ctx.fillStyle = "#4b3a6b";
+  ctx.fillRect(x + 4, y + 8, TILE - 8, TILE - 8);
+  // Hood
+  ctx.fillStyle = "#3a2c55";
+  ctx.fillRect(x + 7, y + 2, TILE - 14, 12);
+  // Eyes glinting in the hood
+  ctx.fillStyle = "#e8d48a";
+  ctx.fillRect(x + 12, y + 8, 2, 2);
+  ctx.fillRect(x + 18, y + 8, 2, 2);
+  // Staff
+  ctx.fillStyle = "#7a5a34";
+  ctx.fillRect(x + TILE - 5, y - 6, 3, TILE + 4);
+}
+
+// Word-wrap text into lines no wider than maxW.
+function wrapText(ctx, text, maxW) {
+  const words = text.split(" "), lines = [];
+  let line = "";
+  for (const w of words) {
+    const test = line ? line + " " + w : w;
+    if (ctx.measureText(test).width > maxW && line) { lines.push(line); line = w; }
+    else line = test;
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+function drawSpeech(ctx, game) {
+  const room = game.room;
+  if (!room.npc || !game.npcTalking || game.npcLine < 0) return;
+  const text = npcLineGroup(game).lines[game.npcLine % npcLineGroup(game).lines.length];
+  ctx.font = "14px monospace";
+  const lines = wrapText(ctx, text, 260);
+  const lh = 18, padX = 10, padY = 8;
+  const w = Math.max(...lines.map((l) => ctx.measureText(l).width)) + padX * 2;
+  const h = lines.length * lh + padY * 2;
+  const cx = room.npc.tx * TILE + TILE / 2;
+  let bx = Math.min(Math.max(cx - w / 2, 8), ROOM_W * TILE - w - 8);
+  const by = room.npc.ty * TILE - h - 16;
+  ctx.fillStyle = "rgba(20, 16, 28, 0.92)";
+  ctx.fillRect(bx, by, w, h);
+  ctx.strokeStyle = "#8c7ab8";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(bx, by, w, h);
+  // little tail pointing at him
+  ctx.fillStyle = "#8c7ab8";
+  ctx.beginPath();
+  ctx.moveTo(cx - 6, by + h); ctx.lineTo(cx + 6, by + h); ctx.lineTo(cx, by + h + 8);
+  ctx.fill();
+  ctx.fillStyle = "#ece4f6";
+  ctx.textAlign = "left";
+  lines.forEach((l, i) => ctx.fillText(l, bx + padX, by + padY + 13 + i * lh));
 }
 
 function drawPlayer(ctx, p, over) {
@@ -659,6 +868,14 @@ function drawSwing(ctx, ent, trail, blade) {
 
 function drawEffects(ctx, game) {
   for (const e of game.effects) {
+    if (e.kind === "heal") {
+      const k = e.t / e.max;
+      ctx.fillStyle = `rgba(140, 255, 210, ${k})`;
+      ctx.font = "bold 14px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("+1", e.x, e.y - 6 - (1 - k) * 18);
+      continue;
+    }
     if (e.kind !== "bones") continue;
     const k = e.t / e.max;           // 1 → 0
     const spread = (1 - k) * 10;
@@ -682,12 +899,23 @@ function drawHud(ctx, game) {
   ctx.fillStyle = "#cfc6b8";
   ctx.font = "14px monospace";
   ctx.textAlign = "right";
-  ctx.fillText("Skeletons slain: " + game.kills, ROOM_W * TILE - 12, 21);
+  if (game.area === "arena") ctx.fillText("Skeletons slain: " + game.kills, ROOM_W * TILE - 12, 21);
+  else ctx.fillText("Safe room", ROOM_W * TILE - 12, 21);
   ctx.textAlign = "center";
   ctx.fillStyle = "#9c9486";
   ctx.font = "12px monospace";
-  ctx.fillText("Skeleton difficulty " + game.difficulty.toFixed(2) + "  (keys 1-5: easy to hard)",
-    (ROOM_W * TILE) / 2, ROOM_H * TILE - 10);
+  const hint = game.area === "arena"
+    ? "Test arena  |  Skeleton difficulty " + game.difficulty.toFixed(2) + " (keys 1-5)  |  T: back to safe room"
+    : "T: test arena (until the maze exists)";
+  ctx.fillText(hint, (ROOM_W * TILE) / 2, ROOM_H * TILE - 10);
+
+  if (game.doorMsg > 0) {
+    ctx.globalAlpha = Math.min(1, game.doorMsg / 0.4);
+    ctx.fillStyle = "#e8dcc4";
+    ctx.font = "16px monospace";
+    ctx.fillText("The door won't budge. Not yet.", (ROOM_W * TILE) / 2, 17 * TILE + 22);
+    ctx.globalAlpha = 1;
+  }
 
   if (game.over) {
     ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
@@ -697,17 +925,20 @@ function drawHud(ctx, game) {
     ctx.font = "40px monospace";
     ctx.fillText("You died", (ROOM_W * TILE) / 2, (ROOM_H * TILE) / 2 - 10);
     ctx.font = "16px monospace";
-    ctx.fillText("Press R to try again", (ROOM_W * TILE) / 2, (ROOM_H * TILE) / 2 + 24);
+    ctx.fillText("Press R to return to the safe room", (ROOM_W * TILE) / 2, (ROOM_H * TILE) / 2 + 24);
   }
 }
 
-function draw(ctx, game) {
+function draw(ctx, game, time) {
   drawRoom(ctx, game.room);
-  drawEffects(ctx, game);
+  drawHealGlow(ctx, game.room, time || 0);
+  drawNpc(ctx, game.room);
   for (const sk of game.skeletons) drawSkeleton(ctx, sk);
   drawPlayer(ctx, game.player, game.over);
   for (const sk of game.skeletons) drawSwing(ctx, sk, "rgba(255, 110, 80, 0.20)", "#f0c8b8");
   drawSwing(ctx, game.player, "rgba(230, 235, 255, 0.18)", "#e8ecf8");
+  drawEffects(ctx, game);
+  drawSpeech(ctx, game);
   drawHud(ctx, game);
 }
 
@@ -734,12 +965,17 @@ if (typeof window !== "undefined" && typeof document !== "undefined" && document
       return;
     }
     if (e.code === "KeyR" && game.over) {
+      // Back to the checkpoint: the safe room, full health.
       game = makeGame((Math.random() * 1e9) | 0, { difficulty: game.difficulty });
+      return;
+    }
+    if (e.code === "KeyT" && !game.over) {
+      switchArea(game);
       return;
     }
     // Testing: 1-5 set skeleton difficulty (0, 0.25, 0.5, 0.75, 1) and respawn the wave.
     const digit = ["Digit1", "Digit2", "Digit3", "Digit4", "Digit5"].indexOf(e.code);
-    if (digit >= 0 && !game.over) {
+    if (digit >= 0 && !game.over && game.area === "arena") {
       setDifficulty(game, digit / 4);
       return;
     }
@@ -766,7 +1002,7 @@ if (typeof window !== "undefined" && typeof document !== "undefined" && document
       stepGame(game, input, STEP);
       acc -= STEP;
     }
-    draw(ctx, game);
+    draw(ctx, game, now / 1000);
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
