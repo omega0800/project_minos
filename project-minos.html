@@ -35,6 +35,17 @@ const ROOM_H = 20;
 // (3cx+1 .. 3cx+2, 3cy+1 .. 3cy+2); walls sit on multiples of 3.
 const CELL = 3;
 const FLOOR_CELLS = 31;     // floor size in cells for now (31 x 31 cells = 94 x 94 tiles)
+
+// Maze generation
+const BRANCH_CHANCE = 0.4;  // chance each side of a new cell opens into untouched space (q)
+
+// Torchlight
+const TORCH_RADIUS = 6.5 * TILE;  // you can see this far (blocked by walls)
+const TORCH_FULL = 3 * TILE;      // fully bright out to here, then fades
+const EXPLORED_DARK = 0.72;       // darkness over places you've seen but can't see now
+// Cells are created this far from you: comfortably past the torchlight, so
+// you never see unbuilt space or a wall turning into an opening.
+const GEN_RADIUS = TORCH_RADIUS + 2 * CELL * TILE;
 const STEP = 1 / 60;        // fixed simulation step, seconds
 
 const PLAYER_SIZE = 22;     // player hitbox, pixels (square)
@@ -186,9 +197,11 @@ function makeFloorGrid(cellsW, cellsH) {
   return { w, h, cellsW, cellsH, tiles: new Uint8Array(w * h).fill(VOID) };
 }
 
-function setTile(room, x, y, t) {
+function setTileRaw(room, x, y, t) {
   if (x >= 0 && y >= 0 && x < room.w && y < room.h) room.tiles[y * room.w + x] = t;
 }
+
+const setTile = setTileRaw;
 
 // Make a cell's 2x2 patch walkable.
 function carveCell(room, cx, cy) {
@@ -197,8 +210,10 @@ function carveCell(room, cx, cy) {
 }
 
 // Open the wall between a cell and its neighbour (dir: "n", "s", "e" or "w").
+// Doorway tiles stay doorways.
 function openEdge(room, cx, cy, dir) {
   const bx = cx * CELL, by = cy * CELL;
+  const setTile = (r, x, y, t) => { if (tileAt(r, x, y) !== DOOR) setTileRaw(r, x, y, t); };
   if (dir === "n") { setTile(room, bx + 1, by, FLOOR); setTile(room, bx + 2, by, FLOOR); }
   if (dir === "s") { setTile(room, bx + 1, by + CELL, FLOOR); setTile(room, bx + 2, by + CELL, FLOOR); }
   if (dir === "w") { setTile(room, bx, by + 1, FLOOR); setTile(room, bx, by + 2, FLOOR); }
@@ -224,9 +239,10 @@ function wallUp(room) {
 // 7 x 6 cells. It has a healing nook in its top wall, the Old Man, and a
 // 2-wide doorway in its bottom wall that lines up with the cell below it, so
 // the maze can grow from there.
-function makeFirstFloor() {
-  const room = makeFloorGrid(FLOOR_CELLS, FLOOR_CELLS);
-  const c = Math.floor(FLOOR_CELLS / 2);                 // centre cell (15)
+function makeFirstFloor(cells) {
+  const n = cells || FLOOR_CELLS;                        // odd, at least 9
+  const room = makeFloorGrid(n, n);
+  const c = Math.floor(n / 2);                           // centre cell
   const bx0 = (c - 3) * CELL, by0 = (c - 3) * CELL;      // safe block's top-left tile
   // Room floor: 20 x 14 tiles.
   const fx0 = bx0 + 1, fx1 = bx0 + 7 * CELL - 1;
@@ -244,16 +260,19 @@ function makeFirstFloor() {
   const npc = { tx: fx0 + 13, ty: fy0 + 4 };
   setTile(room, npc.tx, npc.ty, NPC);
 
-  // Step 1 stand-in for the maze: a short hand-built corridor out of the door.
-  const doorCellY = c + 3;                               // the cell just below the door
-  const path = [[c, doorCellY], [c, doorCellY + 1], [c, doorCellY + 2], [c + 1, doorCellY + 2],
-                [c + 2, doorCellY + 2], [c + 2, doorCellY + 3], [c + 2, doorCellY + 4],
-                [c - 1, doorCellY + 2], [c - 2, doorCellY + 2], [c - 3, doorCellY + 2], [c - 3, doorCellY + 1]];
-  for (const [x, y] of path) carveCell(room, x, y);
-  const links = [[c, doorCellY, "s"], [c, doorCellY + 1, "s"], [c, doorCellY + 2, "e"], [c + 1, doorCellY + 2, "e"],
-                 [c + 2, doorCellY + 2, "s"], [c + 2, doorCellY + 3, "s"],
-                 [c, doorCellY + 2, "w"], [c - 1, doorCellY + 2, "w"], [c - 2, doorCellY + 2, "w"], [c - 3, doorCellY + 2, "n"]];
-  for (const [x, y, d] of links) openEdge(room, x, y, d);
+  // Cell bookkeeping for the maze. The safe room's 7x6 block is reserved;
+  // its only way out is the doorway, which opens into the cell below it.
+  initCells(room);
+  for (let cy = c - 3; cy <= c + 2; cy++)
+    for (let cx = c - 3; cx <= c + 3; cx++) {
+      room.cells[cy * room.cellsW + cx] = CELL_RESERVED;
+      for (const d of DIRS) {
+        const n = neighbour(room, cx, cy, d);
+        if (n && room.cells[n.cy * room.cellsW + n.cx] !== CELL_RESERVED) setEdge(room, cx, cy, d, EDGE_WALL);
+      }
+    }
+  setEdge(room, c, c + 2, "s", EDGE_OPEN);
+  claim(room, c, c + 3, c, c + 2, "s");
 
   wallUp(room);
   room.npc = npc;
@@ -262,6 +281,241 @@ function makeFirstFloor() {
   room.door = { tx: mid, ty: doorY };
   room.spawn = { x: ((fx0 + fx1 + 1) / 2) * TILE, y: ((fy0 + fy1 + 1) / 2) * TILE }; // pixel centre
   return room;
+}
+
+// ---------- Maze generation ----------
+// Each cell is ungenerated, generated, or reserved (the safe room). Each wall
+// between two cells is undecided, wall, or open. An ungenerated cell that an
+// open wall leads into is "claimed": it's on the frontier, waiting to be built.
+const CELL_EMPTY = 0, CELL_BUILT = 1, CELL_RESERVED = 2;
+const EDGE_UNDECIDED = -1, EDGE_WALL = 0, EDGE_OPEN = 1;
+const DIRS = ["n", "e", "s", "w"];
+const DIR_STEP = { n: [0, -1], e: [1, 0], s: [0, 1], w: [-1, 0] };
+const OPPOSITE = { n: "s", e: "w", s: "n", w: "e" };
+
+function initCells(room) {
+  const W = room.cellsW, H = room.cellsH;
+  room.cells = new Uint8Array(W * H);                     // CELL_*
+  room.claimed = new Uint8Array(W * H);                   // 1 = on the frontier
+  room.edgeH = new Int8Array((W - 1) * H).fill(EDGE_UNDECIDED); // between (cx,cy) and (cx+1,cy)
+  room.edgeV = new Int8Array(W * (H - 1)).fill(EDGE_UNDECIDED); // between (cx,cy) and (cx,cy+1)
+  room.frontier = [];                                     // [{ cx, cy, from: {cx, cy, dir} }]
+  room.builtCount = 0;
+  room.seen = new Uint8Array(room.w * room.h);            // tiles you've ever seen
+  room.visible = new Uint8Array(room.w * room.h);         // tiles you can see right now
+  room.visList = [];
+}
+
+function neighbour(room, cx, cy, dir) {
+  const [dx, dy] = DIR_STEP[dir];
+  const nx = cx + dx, ny = cy + dy;
+  if (nx < 0 || ny < 0 || nx >= room.cellsW || ny >= room.cellsH) return null;
+  return { cx: nx, cy: ny };
+}
+
+function edgeSlot(room, cx, cy, dir) {
+  if (!neighbour(room, cx, cy, dir)) return null;
+  const W = room.cellsW;
+  if (dir === "e") return { arr: room.edgeH, i: cy * (W - 1) + cx };
+  if (dir === "w") return { arr: room.edgeH, i: cy * (W - 1) + cx - 1 };
+  if (dir === "s") return { arr: room.edgeV, i: cy * W + cx };
+  return { arr: room.edgeV, i: (cy - 1) * W + cx };
+}
+
+function getEdge(room, cx, cy, dir) {
+  const e = edgeSlot(room, cx, cy, dir);
+  return e ? e.arr[e.i] : EDGE_WALL;
+}
+
+function setEdge(room, cx, cy, dir, v) {
+  const e = edgeSlot(room, cx, cy, dir);
+  if (e) e.arr[e.i] = v;
+}
+
+function cellState(room, cx, cy) { return room.cells[cy * room.cellsW + cx]; }
+
+// Put an ungenerated cell on the frontier, reached through (fromCx, fromCy, dir).
+function claim(room, cx, cy, fromCx, fromCy, dir) {
+  room.claimed[cy * room.cellsW + cx] = 1;
+  room.frontier.push({ cx, cy, from: { cx: fromCx, cy: fromCy, dir } });
+}
+
+function cellCentre(cx, cy) {
+  return { x: (cx * CELL + 2) * TILE, y: (cy * CELL + 2) * TILE };
+}
+
+// Walls go up only around the new cell (the rest of the floor is unchanged).
+function wallUpAround(room, cx, cy) {
+  const x0 = cx * CELL - 1, y0 = cy * CELL - 1;
+  for (let y = y0; y <= y0 + CELL + 2; y++)
+    for (let x = x0; x <= x0 + CELL + 2; x++) {
+      if (tileAt(room, x, y) !== VOID) continue;
+      let touches = false;
+      for (let dy = -1; dy <= 1 && !touches; dy++)
+        for (let dx = -1; dx <= 1 && !touches; dx++)
+          if (isWalkable(tileAt(room, x + dx, y + dy))) touches = true;
+      if (touches) setTile(room, x, y, WALL);
+    }
+}
+
+// Build one frontier cell: carve it, open the way in, and decide its other sides.
+function buildCell(game, entry) {
+  const room = game.room, rng = game.rng;
+  const { cx, cy, from } = entry;
+  room.frontier = room.frontier.filter((f) => f !== entry);
+  room.claimed[cy * room.cellsW + cx] = 0;
+  room.cells[cy * room.cellsW + cx] = CELL_BUILT;
+  room.builtCount++;
+  carveCell(room, cx, cy);
+  openEdge(room, from.cx, from.cy, from.dir);
+
+  // Decide the other sides, in random order.
+  const dirs = DIRS.slice();
+  for (let i = dirs.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [dirs[i], dirs[j]] = [dirs[j], dirs[i]]; }
+  const openable = []; // sides that lead into untouched space
+  for (const d of dirs) {
+    const n = neighbour(room, cx, cy, d);
+    if (!n || getEdge(room, cx, cy, d) !== EDGE_UNDECIDED) continue;
+    const untouched = cellState(room, n.cx, n.cy) === CELL_EMPTY && !room.claimed[n.cy * room.cellsW + n.cx];
+    if (untouched) openable.push({ d, n });
+    if (untouched && rng() < BRANCH_CHANCE) {
+      setEdge(room, cx, cy, d, EDGE_OPEN);
+      claim(room, n.cx, n.cy, cx, cy, d);
+    } else {
+      setEdge(room, cx, cy, d, EDGE_WALL); // no loops yet: never open into built or claimed cells
+    }
+  }
+
+  // Never seal off untouched space: if walling a side would leave the space
+  // behind it with no other way in, open this side instead. (This cell is
+  // being built out of sight, so the opening is never one you've seen.)
+  for (const { d, n } of openable) {
+    if (getEdge(room, cx, cy, d) === EDGE_OPEN) continue;
+    if (room.claimed[n.cy * room.cellsW + n.cx] || cellState(room, n.cx, n.cy) !== CELL_EMPTY) continue;
+    if (!regionHasWayIn(room, n.cx, n.cy)) {
+      setEdge(room, cx, cy, d, EDGE_OPEN);
+      claim(room, n.cx, n.cy, cx, cy, d);
+    }
+  }
+
+  // Backstop: never let the maze close off while untouched space remains.
+  if (room.frontier.length === 0) {
+    if (openable.length > 0) {
+      const pick = openable[Math.floor(rng() * openable.length)];
+      setEdge(room, cx, cy, pick.d, EDGE_OPEN);
+      claim(room, pick.n.cx, pick.n.cy, cx, cy, pick.d);
+    } else {
+      forceOpening(game);
+    }
+  }
+  wallUpAround(room, cx, cy);
+}
+
+// Is the patch of untouched cells containing (cx, cy) next to a frontier cell?
+// (A frontier cell is still to be built, so it can still open into the patch.)
+function regionHasWayIn(room, cx, cy) {
+  const W = room.cellsW;
+  const seen = new Set([cy * W + cx]), stack = [[cx, cy]];
+  while (stack.length) {
+    const [x, y] = stack.pop();
+    for (const d of DIRS) {
+      const n = neighbour(room, x, y, d);
+      if (!n) continue;
+      const j = n.cy * W + n.cx;
+      if (room.claimed[j]) return true;
+      if (cellState(room, n.cx, n.cy) !== CELL_EMPTY || seen.has(j)) continue;
+      seen.add(j);
+      stack.push([n.cx, n.cy]);
+    }
+  }
+  return false;
+}
+
+// Last resort: open a wall somewhere between a built cell and untouched space.
+// Prefers walls the player has never seen, then ones not in view right now.
+function forceOpening(game) {
+  const room = game.room, rng = game.rng;
+  const unseen = [], hidden = [], shown = [];
+  for (let cy = 0; cy < room.cellsH; cy++)
+    for (let cx = 0; cx < room.cellsW; cx++) {
+      if (cellState(room, cx, cy) !== CELL_BUILT) continue;
+      for (const d of DIRS) {
+        const n = neighbour(room, cx, cy, d);
+        if (!n || cellState(room, n.cx, n.cy) !== CELL_EMPTY || room.claimed[n.cy * room.cellsW + n.cx]) continue;
+        const bx = cx * CELL, by = cy * CELL;
+        const wx = d === "e" ? bx + CELL : d === "w" ? bx : bx + 1;
+        const wy = d === "s" ? by + CELL : d === "n" ? by : by + 1;
+        const i = wy * room.w + wx;
+        (room.visible[i] ? shown : room.seen[i] ? hidden : unseen).push({ cx, cy, d, n });
+      }
+    }
+  room.forcedCount = (room.forcedCount || 0) + 1;
+  const pool = unseen.length ? unseen : hidden.length ? hidden : shown;
+  if (!pool.length) return; // the floor is full
+  const pick = pool[Math.floor(rng() * pool.length)];
+  setEdge(room, pick.cx, pick.cy, pick.d, EDGE_OPEN);
+  claim(room, pick.n.cx, pick.n.cy, pick.cx, pick.cy, pick.d);
+}
+
+// Build every frontier cell within GEN_RADIUS of the player (repeats, since
+// new cells can put more of the frontier in range).
+function growMaze(game) {
+  const room = game.room;
+  if (!room.frontier) return;
+  const pc = centerOf(game.player);
+  for (let guard = 0; guard < 500; guard++) {
+    const next = room.frontier.find((f) => {
+      const c = cellCentre(f.cx, f.cy);
+      return Math.hypot(c.x - pc.x, c.y - pc.y) <= GEN_RADIUS;
+    });
+    if (!next) break;
+    buildCell(game, next);
+  }
+}
+
+// ---------- Torchlight ----------
+const LOS_POINTS = [[0.5, 0.5], [0.15, 0.15], [0.85, 0.15], [0.15, 0.85], [0.85, 0.85]];
+// A tile is visible if a straight line from the player reaches it without
+// passing through anything solid first. Everything visible is remembered.
+function computeVisibility(game) {
+  const room = game.room;
+  if (!room.visible) return;
+  for (const i of room.visList) room.visible[i] = 0;
+  room.visList.length = 0;
+  const mark = (x, y) => {
+    const i = y * room.w + x;
+    if (!room.visible[i]) { room.visible[i] = 1; room.seen[i] = 1; room.visList.push(i); }
+  };
+  const pc = centerOf(game.player);
+  const r = Math.ceil(TORCH_RADIUS / TILE);
+  const ptx = Math.floor(pc.x / TILE), pty = Math.floor(pc.y / TILE);
+  const step = TILE / 4;
+  for (let ty = pty - r; ty <= pty + r; ty++)
+    for (let tx = ptx - r; tx <= ptx + r; tx++) {
+      if (tx < 0 || ty < 0 || tx >= room.w || ty >= room.h) continue;
+      const dist = Math.hypot((tx + 0.5) * TILE - pc.x, (ty + 0.5) * TILE - pc.y);
+      if (dist > TORCH_RADIUS) continue;
+      // Visible if a clear line reaches any of 5 points on the tile (its centre
+      // or its four inner corners), so wall corners don't leave dark gaps.
+      for (const [ox, oy] of LOS_POINTS) {
+        const gx = (tx + ox) * TILE, gy = (ty + oy) * TILE;
+        const n = Math.max(1, Math.ceil(Math.hypot(gx - pc.x, gy - pc.y) / step));
+        let blocked = false;
+        for (let k = 1; k < n; k++) {
+          const sx = Math.floor((pc.x + (gx - pc.x) * (k / n)) / TILE);
+          const sy = Math.floor((pc.y + (gy - pc.y) * (k / n)) / TILE);
+          if (sx === tx && sy === ty) break;
+          if (isSolid(room, sx, sy)) { blocked = true; break; }
+        }
+        if (!blocked) { mark(tx, ty); break; }
+      }
+    }
+  // The safe room is lit: inside it you see all of it.
+  if (inSafeRoom(game)) {
+    const sr = room.safeRect;
+    for (let y = sr.y0 - 1; y <= sr.y1 + 1; y++)
+      for (let x = sr.x0 - 1; x <= sr.x1 + 1; x++) if (tileAt(room, x, y) !== VOID) mark(x, y);
+  }
 }
 
 function inSafeRoom(game) {
@@ -643,8 +897,10 @@ function playerAttacks(game) {
 // opts.skeletons === false: no skeleton waves in the arena (used by movement tests)
 function makeGame(seed, opts) {
   const area = (opts && opts.area) || "maze";
-  const room = area === "maze" ? makeFirstFloor() : makeRoom(ROOM_W, ROOM_H);
+  const floorCells = (opts && opts.floorCells) || FLOOR_CELLS; // opts.floorCells: smaller floors for tests
+  const room = area === "maze" ? makeFirstFloor(floorCells) : makeRoom(ROOM_W, ROOM_H);
   const game = {
+    floorCells,
     area,
     room,
     player: makePlayer(room),
@@ -664,6 +920,7 @@ function makeGame(seed, opts) {
     difficulty: (opts && opts.difficulty) || 0, // skeleton difficulty for new waves (testing keys 1-5)
   };
   if (game.waves && area === "arena") spawnWave(game, WAVE_SIZE);
+  if (area === "maze") { growMaze(game); computeVisibility(game); }
   return game;
 }
 
@@ -671,7 +928,7 @@ function makeGame(seed, opts) {
 function switchArea(game) {
   const hp = game.player.hp;
   game.area = game.area === "maze" ? "arena" : "maze";
-  game.room = game.area === "maze" ? makeFirstFloor() : makeRoom(ROOM_W, ROOM_H);
+  game.room = game.area === "maze" ? makeFirstFloor(game.floorCells) : makeRoom(ROOM_W, ROOM_H);
   game.player = makePlayer(game.room);
   game.player.hp = hp;
   game.skeletons = [];
@@ -679,6 +936,7 @@ function switchArea(game) {
   game.waveTimer = 0;
   game.npcTalking = false;
   if (game.area === "arena" && game.waves) spawnWave(game, WAVE_SIZE);
+  if (game.area === "maze") { growMaze(game); computeVisibility(game); }
 }
 
 // ---------- Safe room behaviour ----------
@@ -734,7 +992,11 @@ function stepGame(game, input, dt) {
     return;
   }
   updatePlayer(game.room, game.player, input, dt);
-  if (game.area === "maze") updateSafeRoom(game, dt);
+  if (game.area === "maze") {
+    updateSafeRoom(game, dt);
+    growMaze(game);
+    computeVisibility(game);
+  }
   playerAttacks(game);
   for (const sk of game.skeletons) updateSkeleton(game, sk, dt);
   separateSkeletons(game, dt);
@@ -808,6 +1070,33 @@ function drawHealGlow(ctx, room, time) {
   for (let ty = r.y0; ty <= r.y1; ty++)
     for (let tx = r.x0; tx <= r.x1; tx++)
       if (tileAt(room, tx, ty) === HEAL) ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
+}
+
+// Darkness over the map: black where you've never looked, dim where you've
+// been, and fading toward the edge of your torchlight.
+function drawLighting(ctx, game, cam) {
+  const room = game.room;
+  if (!room.seen) return;
+  const pc = centerOf(game.player);
+  const tx0 = Math.max(0, Math.floor(cam.x / TILE)), tx1 = Math.min(room.w - 1, Math.floor((cam.x + VIEW_W) / TILE));
+  const ty0 = Math.max(0, Math.floor(cam.y / TILE)), ty1 = Math.min(room.h - 1, Math.floor((cam.y + VIEW_H) / TILE));
+  const lit = inSafeRoom(game);
+  for (let ty = ty0; ty <= ty1; ty++)
+    for (let tx = tx0; tx <= tx1; tx++) {
+      const i = ty * room.w + tx;
+      let a;
+      if (!room.seen[i]) a = 1;
+      else if (!room.visible[i]) a = EXPLORED_DARK;
+      else if (lit && room.safeRect && tx >= room.safeRect.x0 - 1 && tx <= room.safeRect.x1 + 1 &&
+               ty >= room.safeRect.y0 - 1 && ty <= room.safeRect.y1 + 1) a = 0;
+      else {
+        const d = Math.hypot((tx + 0.5) * TILE - pc.x, (ty + 0.5) * TILE - pc.y);
+        a = Math.max(0, Math.min(1, (d - TORCH_FULL) / (TORCH_RADIUS - TORCH_FULL))) * 0.6;
+      }
+      if (a <= 0) continue;
+      ctx.fillStyle = a >= 1 ? "#0b0a0c" : `rgba(11, 10, 12, ${a})`;
+      ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
+    }
 }
 
 function drawNpc(ctx, room) {
@@ -1022,6 +1311,7 @@ function draw(ctx, game, time) {
   for (const sk of game.skeletons) drawSwing(ctx, sk, "rgba(255, 110, 80, 0.20)", "#f0c8b8");
   drawSwing(ctx, game.player, "rgba(230, 235, 255, 0.18)", "#e8ecf8");
   drawEffects(ctx, game);
+  drawLighting(ctx, game, cam);
   drawSpeech(ctx, game, cam);
   ctx.restore();                           // ...screen space from here
   drawHud(ctx, game);

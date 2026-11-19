@@ -16,7 +16,7 @@ function loadGame() {
   vm.runInContext(
     m[1] + "\n;this.__api = { TILE, ROOM_W, ROOM_H, STEP, PLAYER_SPEED, WALL, FLOOR, makeGame, stepGame, tileAt, boxHitsWall," +
       " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER, FACING_LOCK_EXTRA, CHAIN_GRACE," +
-      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED, makeFirstFloor, switchArea, HEAL, DOOR, NPC, VOID, HEAL_INTERVAL, NPC_TALK_RANGE, NPC_LINES, cameraFor, inSafeRoom, VIEW_W, VIEW_H, CELL, isWalkable };",
+      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED, makeFirstFloor, switchArea, HEAL, DOOR, NPC, VOID, HEAL_INTERVAL, NPC_TALK_RANGE, NPC_LINES, cameraFor, inSafeRoom, VIEW_W, VIEW_H, CELL, isWalkable, CELL_EMPTY, CELL_BUILT, CELL_RESERVED, EDGE_OPEN, EDGE_UNDECIDED, DIRS, neighbour, getEdge, cellCentre, TORCH_RADIUS, GEN_RADIUS };",
     ctx
   );
   return ctx.__api;
@@ -465,6 +465,130 @@ console.log("Floor 1 and the safe room");
   check("T: arena has skeletons and keeps your HP", t.area === "arena" && t.skeletons.length === G.WAVE_SIZE && t.player.hp === 3);
   G.switchArea(t);
   check("T again: back on floor 1 in the safe room, still 3 HP", t.area === "maze" && G.inSafeRoom(t) && t.player.hp === 3);
+}
+
+console.log("Maze generation");
+{
+  // Explore a whole floor by hopping to the frontier (fast; checks the maze's shape).
+  function exploreAll(seed) {
+    const g = G.makeGame(seed);
+    const r = g.room;
+    for (let guard = 0; guard < 5000 && r.frontier.length; guard++) {
+      const f = r.frontier[0].from;
+      const c = G.cellCentre(f.cx, f.cy);
+      g.player.x = c.x - 11; g.player.y = c.y - 11;
+      G.stepGame(g, none, G.STEP);
+    }
+    return g;
+  }
+  let allFull = true, allTree = true, allConnected = true, allSealed = true, minBuilt = Infinity, maxForced = 0;
+  for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) {
+    const g = exploreAll(seed), r = g.room, W = r.cellsW, H = r.cellsH;
+    let reserved = 0, empty = 0, openEdges = 0;
+    for (let cy = 0; cy < H; cy++) for (let cx = 0; cx < W; cx++) {
+      const st = r.cells[cy * W + cx];
+      if (st === G.CELL_RESERVED) reserved++;
+      if (st === G.CELL_EMPTY) empty++;
+      for (const d of ["e", "s"]) {
+        const n = G.neighbour(r, cx, cy, d);
+        if (!n) continue;
+        const bothReserved = st === G.CELL_RESERVED && r.cells[n.cy * W + n.cx] === G.CELL_RESERVED;
+        if (!bothReserved && G.getEdge(r, cx, cy, d) === G.EDGE_OPEN) openEdges++;
+      }
+    }
+    if (empty !== 0) allFull = false;
+    // A tree (safe room counted as one node): exactly one way into every built cell.
+    if (openEdges !== r.builtCount) allTree = false;
+    // Everything reachable from the safe room.
+    const seen = new Uint8Array(W * H), q = [];
+    for (let i = 0; i < W * H; i++) if (r.cells[i] === G.CELL_RESERVED) { seen[i] = 1; q.push(i); }
+    while (q.length) {
+      const i = q.pop(), cx = i % W, cy = (i / W) | 0;
+      for (const d of G.DIRS) {
+        const n = G.neighbour(r, cx, cy, d);
+        if (!n || G.getEdge(r, cx, cy, d) !== G.EDGE_OPEN) continue;
+        const j = n.cy * W + n.cx;
+        if (!seen[j]) { seen[j] = 1; q.push(j); }
+      }
+    }
+    if (seen.reduce((a, b) => a + b, 0) !== r.builtCount + reserved) allConnected = false;
+    for (let y = 0; y < r.h; y++) for (let x = 0; x < r.w; x++) {
+      if (!G.isWalkable(G.tileAt(r, x, y))) continue;
+      for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]])
+        if (G.tileAt(r, x + dx, y + dy) === G.VOID) allSealed = false;
+    }
+    minBuilt = Math.min(minBuilt, r.builtCount);
+    maxForced = Math.max(maxForced, r.forcedCount || 0);
+  }
+  check("8 floors explored fully: every cell gets built (never traps you)", allFull, "smallest=" + minBuilt);
+  check("no loops yet: the maze is a tree", allTree);
+  check("every cell is reachable from the safe room", allConnected);
+  check("everything walkable is walled in", allSealed);
+  console.log("        (anti-trap opened a wall at most " + maxForced + " times on one floor)");
+  check("hallways stay 2 wide: each cell's floor is a 2x2 patch",
+    (() => { const g = exploreAll(3), r = g.room; for (let cy = 0; cy < r.cellsH; cy++) for (let cx = 0; cx < r.cellsW; cx++) {
+      if (r.cells[cy * r.cellsW + cx] !== G.CELL_BUILT) continue;
+      for (let dy = 1; dy <= 2; dy++) for (let dx = 1; dx <= 2; dx++) if (!G.isWalkable(G.tileAt(r, cx * 3 + dx, cy * 3 + dy))) return false; }
+      return true; })());
+
+  check("generation reaches past the torchlight", G.GEN_RADIUS > G.TORCH_RADIUS + G.CELL * G.TILE);
+}
+
+console.log("Walking the maze (never see it being built)");
+{
+  // A bot that really walks: heads for the nearest frontier through open cells.
+  // Small 15x15 floor so the test stays quick; full-size timing is a tuning job.
+  const g = G.makeGame(11, { floorCells: 15 }), r = g.room, W = r.cellsW, T = G.TILE;
+  const typeAt = new Int8Array(r.w * r.h).fill(-1); // tile type when last seen
+  let sawVoid = 0, popped = 0, steps = 0;
+  const cellOf = () => { const c = { x: g.player.x + 11, y: g.player.y + 11 }; return { cx: Math.floor(c.x / (3 * T)), cy: Math.floor(c.y / (3 * T)) }; };
+  function pathTo(targets) {
+    const start = cellOf(), prev = new Map(), key = (cx, cy) => cy * W + cx;
+    const q = [[start.cx, start.cy]]; prev.set(key(start.cx, start.cy), null);
+    while (q.length) {
+      const [cx, cy] = q.shift();
+      if (targets.has(key(cx, cy))) {
+        const path = []; let k = key(cx, cy);
+        while (k !== null) { path.unshift(k); k = prev.get(k); }
+        return path;
+      }
+      for (const d of G.DIRS) {
+        const n = G.neighbour(r, cx, cy, d);
+        if (!n || G.getEdge(r, cx, cy, d) !== G.EDGE_OPEN) continue;
+        if (r.cells[key(n.cx, n.cy)] !== G.CELL_BUILT) continue;
+        if (!prev.has(key(n.cx, n.cy))) { prev.set(key(n.cx, n.cy), key(cx, cy)); q.push([n.cx, n.cy]); }
+      }
+    }
+    return null;
+  }
+  // Step out of the safe room first.
+  g.player.x = r.door.tx * T + 5;
+  for (let i = 0; i < 200; i++) G.stepGame(g, hold({ down: true }), G.STEP);
+  let path = null;
+  for (; steps < 60000 && r.frontier.length; steps++) {
+    if (!path || !path.length) {
+      path = pathTo(new Set(r.frontier.map((f) => f.from.cy * W + f.from.cx)));
+      if (!path) break;
+    }
+    const k = path[0], c = G.cellCentre(k % W, (k / W) | 0);
+    const px = g.player.x + 11, py = g.player.y + 11;
+    const inp = { right: c.x - px > 2, left: c.x - px < -2, down: c.y - py > 2, up: c.y - py < -2 };
+    if (!inp.right && !inp.left && !inp.down && !inp.up) { path.shift(); continue; }
+    G.stepGame(g, inp, G.STEP);
+    for (const i of r.visList) if (r.tiles[i] === G.VOID) sawVoid++;
+    if (steps % 4 === 0) {
+      for (let i = 0; i < r.w * r.h; i++) {
+        if (!r.seen[i]) continue;
+        if (typeAt[i] !== -1 && typeAt[i] !== r.tiles[i]) popped++;
+        typeAt[i] = r.tiles[i];
+      }
+    }
+  }
+  const total = r.cellsW * r.cellsH - 42;
+  console.log("        (bot walked " + (steps * G.STEP).toFixed(0) + " s of game time, built " + r.builtCount + "/" + total + " cells)");
+  check("walking bot explores the whole floor", r.frontier.length === 0 && r.builtCount === total);
+  check("never sees unbuilt space (no void inside the torchlight)", sawVoid === 0, sawVoid + " times");
+  check("no tile you've seen ever changes (no walls popping open)", popped === 0, popped + " tiles");
 }
 
 function makeFresh() { return G.makeGame(1, { area: "arena", skeletons: false }); }
