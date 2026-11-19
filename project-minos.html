@@ -36,6 +36,7 @@ const SWING_TIME = 0.198;         // how long one swing lasts
 const SWING_COOLDOWN = 0.108;     // pause after a swing before the next can start
 const SWING_ARC = Math.PI * 2 / 3; // 120 degrees, centered on facing
 const SWING_REACH = 40;           // blade tip distance from player center, pixels
+const CHAIN_GRACE = 0.108;        // a press this long after a swing ends still chains (repeats its direction)
 const FACING_LOCK_EXTRA = 0.08;   // facing stays locked this long after a swing ends
 const SWING_MOVE_MULT = 0.5;      // movement speed while swinging
 const SWING_BUFFER = 0.12;        // a press this close to the end of a swing queues the next one
@@ -86,7 +87,9 @@ function makePlayer(room) {
     cooldown: 0,            // time until another swing may start
     facingLock: 0,          // >0 after a swing ends: facing can't turn yet
     buffered: 0,            // >0 while a queued swing press is still fresh
-    chainAngle: null,       // set when the queued press came mid-swing: next swing repeats this angle
+    chainAngle: null,       // set when the queued press came mid-swing or just after: next swing repeats this angle
+    lastAngle: 0,           // direction of the most recent swing
+    sinceSwing: Infinity,   // time since the last swing ended
   };
 }
 
@@ -134,12 +137,15 @@ function moveAxis(room, ent, dx, dy) {
 //   attack: true only on the step the attack key was pressed
 function updatePlayer(room, player, input, dt) {
   // --- Sword ---
-  // Pressing again before a swing finishes "chains" it: the next swing goes the
-  // same direction even if you've started walking another way (lets you back up
-  // while swinging). A press after the swing ends uses your current facing.
+  // Pressing again late in a swing, or within CHAIN_GRACE after it ends, "chains":
+  // the next swing goes the same direction even if you're walking another way
+  // (lets you back up while swinging). A later press uses your current facing.
+  if (!player.swing) player.sinceSwing += dt;
   if (input.attack) {
     player.buffered = SWING_BUFFER;
-    player.chainAngle = player.swing ? player.swing.angle : null;
+    if (player.swing) player.chainAngle = player.swing.angle;
+    else if (player.sinceSwing <= CHAIN_GRACE) player.chainAngle = player.lastAngle;
+    else player.chainAngle = null;
   } else if (player.buffered > 0 && player.cooldown === 0) {
     // The buffer only runs down while a swing could otherwise act on it,
     // so a press late in a swing survives the cooldown that follows.
@@ -150,6 +156,8 @@ function updatePlayer(room, player, input, dt) {
   if (player.swing) {
     player.swing.t += dt;
     if (player.swing.t >= SWING_TIME) {
+      player.lastAngle = player.swing.angle;
+      player.sinceSwing = 0;
       player.swing = null;
       player.cooldown = SWING_COOLDOWN;
       player.facingLock = FACING_LOCK_EXTRA;
@@ -183,7 +191,8 @@ function updatePlayer(room, player, input, dt) {
   ix /= len;
   iy /= len;
   // Facing doesn't turn mid-swing (or just after), so the swing keeps its direction.
-  if (!player.swing && player.facingLock === 0) player.facing = { x: ix, y: iy };
+  // A queued chained swing also holds facing, so you see the direction it will go.
+  if (!player.swing && player.facingLock === 0 && player.chainAngle === null) player.facing = { x: ix, y: iy };
 
   const dist = PLAYER_SPEED * (player.swing ? SWING_MOVE_MULT : 1) * dt;
   moveAxis(room, player, ix * dist, 0);

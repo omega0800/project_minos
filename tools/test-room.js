@@ -15,7 +15,7 @@ function loadGame() {
   vm.createContext(ctx);
   vm.runInContext(
     m[1] + "\n;this.__api = { TILE, ROOM_W, ROOM_H, STEP, PLAYER_SPEED, WALL, FLOOR, makeGame, stepGame, tileAt, boxHitsWall," +
-      " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER, FACING_LOCK_EXTRA };",
+      " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER, FACING_LOCK_EXTRA, CHAIN_GRACE };",
     ctx
   );
   return ctx.__api;
@@ -180,7 +180,10 @@ console.log("Sword");
   const chained = backingUp(0.13);   // pressed before the first swing finishes
   check("press mid-swing while backing up: next swing keeps direction",
     chained && Math.abs(chained.angle - 0) < 1e-9, chained ? "angle=" + chained.angle.toFixed(2) : "no swing");
-  const lateP = backingUp(G.SWING_TIME + 0.09); // pressed after it finished
+  const grace = backingUp(G.SWING_TIME + G.CHAIN_GRACE - 0.03); // just after it finished, within the grace
+  check("press just after the swing (within grace) while backing up: keeps direction",
+    grace && Math.abs(grace.angle - 0) < 1e-9, grace ? "angle=" + grace.angle.toFixed(2) : "no swing");
+  const lateP = backingUp(G.SWING_TIME + G.CHAIN_GRACE + 0.05); // pressed after the grace ran out
   check("press after the swing while backing up: next swing turns around",
     lateP && Math.abs(Math.abs(lateP.angle) - Math.PI) < 1e-9, lateP ? "angle=" + lateP.angle.toFixed(2) : "no swing");
 }
