@@ -16,7 +16,7 @@ function loadGame() {
   vm.runInContext(
     m[1] + "\n;this.__api = { TILE, ROOM_W, ROOM_H, STEP, PLAYER_SPEED, WALL, FLOOR, makeGame, stepGame, tileAt, boxHitsWall," +
       " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER, FACING_LOCK_EXTRA, CHAIN_GRACE," +
-      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED, makeFirstFloor, switchArea, HEAL, DOOR, NPC, VOID, HEAL_INTERVAL, NPC_TALK_RANGE, NPC_LINES, cameraFor, inSafeRoom, VIEW_W, VIEW_H, CELL, isWalkable, CELL_EMPTY, CELL_BUILT, CELL_RESERVED, EDGE_OPEN, EDGE_UNDECIDED, DIRS, neighbour, getEdge, cellCentre, TORCH_RADIUS, GEN_RADIUS, respawnAtCheckpoint, floorDifficulty, exitChance, enterFloor, STAIRS_DOWN, STAIRS_UP, EXIT_K, SAFE_EVERY, FLOOR_MIN_CELLS, FLOOR_MAX_CELLS, inSafeArea, FLOORS_TO_HARD, SKEL_GIVE_UP, setTile, WALL };",
+      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED, makeFirstFloor, switchArea, HEAL, DOOR, NPC, VOID, HEAL_INTERVAL, NPC_TALK_RANGE, NPC_LINES, cameraFor, inSafeRoom, VIEW_W, VIEW_H, CELL, isWalkable, CELL_EMPTY, CELL_BUILT, CELL_RESERVED, EDGE_OPEN, EDGE_UNDECIDED, DIRS, neighbour, getEdge, cellCentre, TORCH_RADIUS, GEN_RADIUS, respawnAtCheckpoint, floorDifficulty, exitChance, enterFloor, STAIRS_DOWN, STAIRS_UP, EXIT_K, SAFE_EVERY, FLOOR_MIN_CELLS, FLOOR_MAX_CELLS, toggleMap, drawMap, mapLayout, hurtPlayer, inSafeArea, FLOORS_TO_HARD, SKEL_GIVE_UP, setTile, WALL };",
     ctx
   );
   return ctx.__api;
@@ -883,6 +883,39 @@ console.log("Stairs and floors");
   const avg = (r) => { const a = r.rooms.flatMap((rm) => rm.spawns.map((sp) => sp.difficulty)); return a.reduce((x, y) => x + y, 0) / a.length; };
   check("floor 10 skeletons are harder than floor 1's", avg(deep.room) > avg(deep.floors.get(1)) + 0.3,
     avg(deep.floors.get(1)).toFixed(2) + " vs " + avg(deep.room).toFixed(2));
+}
+
+console.log("Map");
+{
+  const g = G.makeGame(1, { startFloor: 1 });
+  G.toggleMap(g);
+  check("M opens the map anywhere (even in the maze)", g.mapOpen === true && !G.inSafeRoom(g));
+  G.toggleMap(g);
+  check("M again closes it", g.mapOpen === false);
+
+  // The game keeps running with the map open: a skeleton still hits you.
+  const a = G.makeGame(1, { area: "arena", skeletons: false });
+  a.area = "maze"; G.toggleMap(a); a.area = "arena";            // map open in the arena scenario
+  const sk = G.makeSkeleton(60, a.player.x + 120, a.player.y, a.rng, 0);
+  a.skeletons.push(sk);
+  let hit = false;
+  for (let i = 0; i < Math.round(4 / G.STEP) && !hit; i++) { G.stepGame(a, none, G.STEP); if (a.player.hp < G.PLAYER_MAX_HP) hit = true; }
+  check("the map doesn't pause anything: skeletons still get you", a.mapOpen && hit);
+  a.player.hp = 1; a.player.iframes = 0;
+  G.hurtPlayer(a, sk);
+  check("dying closes the map", a.over && !a.mapOpen);
+
+  // Draws only what you've seen, and fits on screen even for the biggest floors.
+  const calls = [];
+  const ctx = new Proxy({}, { get: (t, k) => k === "fillRect" ? (x, y, w, h) => calls.push([x, y, w, h]) : (typeof t[k] !== "undefined" ? t[k] : () => {}), set: (t, k, v) => (t[k] = v, true) });
+  G.toggleMap(g);
+  G.drawMap(ctx, g, 0);
+  const seen = g.room.seen.reduce((n, v, i) => n + (v && g.room.tiles[i] !== G.VOID ? 1 : 0), 0);
+  const tileRects = calls.length - 1;    // minus the backdrop
+  check("map draws one square per tile you've seen (" + seen + "), nothing else", tileRects === seen, tileRects + " squares");
+  const big = G.makeGame(1, { startFloor: 1, floorCells: 31 });
+  const L = G.mapLayout(big.room);
+  check("a 31x31-cell floor's map fits on screen", L.ox >= 0 && L.oy >= 0 && L.ox + big.room.w * L.scale <= G.VIEW_W && L.oy + big.room.h * L.scale <= G.VIEW_H);
 }
 
 console.log("Walking the maze (never see it being built)");

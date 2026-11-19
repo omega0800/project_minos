@@ -1257,6 +1257,7 @@ function hurtPlayer(game, attacker) {
     p.hp = 0;
     p.swing = null;
     game.over = true;
+    game.mapOpen = false;
   }
 }
 
@@ -1318,6 +1319,7 @@ function makeGame(seed, opts) {
     kills: 0,
     waveTimer: 0,
     over: false,
+    mapOpen: false,        // M: whole-floor map (doesn't pause anything)
     waves: !(opts && opts.skeletons === false),
     difficulty: (opts && opts.difficulty) || 0, // skeleton difficulty for new waves (testing keys 1-5)
   };
@@ -1755,6 +1757,74 @@ function drawEffects(ctx, game) {
   }
 }
 
+// ---------- Map (M) ----------
+// The whole current floor, scaled to fit the screen. Only what you've seen.
+function mapLayout(room) {
+  const scale = Math.max(2, Math.floor(Math.min((VIEW_W - 80) / room.w, (VIEW_H - 110) / room.h)));
+  return { scale, ox: Math.round((VIEW_W - room.w * scale) / 2), oy: Math.round((VIEW_H - room.h * scale) / 2) + 14 };
+}
+
+function toggleMap(game) {
+  if (game.area === "maze" && !game.over) game.mapOpen = !game.mapOpen;
+}
+
+const MAP_COLOURS = {
+  [FLOOR]: "#4b4339", [DOOR]: "#6a5a44", [WALL]: "#9a9aae", [NPC]: "#8c6fc4",
+  [HEAL]: "#4fd1b0", [STAIRS_UP]: "#c9b98f", [STAIRS_DOWN]: "#ffd166",
+};
+
+function drawMap(ctx, game, time) {
+  const room = game.room;
+  if (!game.mapOpen || !room.seen) return;
+  const { scale: k, ox, oy } = mapLayout(room);
+  ctx.fillStyle = "rgba(8, 7, 10, 0.9)";
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  for (let ty = 0; ty < room.h; ty++)
+    for (let tx = 0; tx < room.w; tx++) {
+      const i = ty * room.w + tx;
+      if (!room.seen[i]) continue;
+      const c = MAP_COLOURS[room.tiles[i]];
+      if (!c) continue;
+      ctx.fillStyle = c;
+      ctx.fillRect(ox + tx * k, oy + ty * k, k, k);
+    }
+  // Stairs you've seen get a ring so they stand out.
+  const ring = (tiles, colour) => {
+    if (!tiles || !tiles.some(([x, y]) => room.seen[y * room.w + x])) return;
+    const cx = ox + (tiles[0][0] + tiles[1][0] + 1) / 2 * k, cy = oy + (tiles[0][1] + tiles[1][1] + 1) / 2 * k;
+    ctx.strokeStyle = colour;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, Math.max(6, k * 2), 0, Math.PI * 2);
+    ctx.stroke();
+  };
+  ring(room.exit && room.exit.tiles, "#ffd166");
+  ring(room.upStairs && room.upStairs.tiles, "#c9b98f");
+  // You (blinking), with a tick for your facing.
+  const pc = centerOf(game.player);
+  const px = ox + (pc.x / TILE) * k, py = oy + (pc.y / TILE) * k;
+  if (Math.floor((time || 0) * 3) % 2 === 0) {
+    ctx.fillStyle = "#ffe08a";
+    ctx.beginPath();
+    ctx.arc(px, py, Math.max(3, k * 0.9), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.strokeStyle = "#ffe08a";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(px, py);
+  ctx.lineTo(px + game.player.facing.x * k * 3, py + game.player.facing.y * k * 3);
+  ctx.stroke();
+  // Title and legend
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#e8dcc4";
+  ctx.font = "16px monospace";
+  ctx.fillText("Floor " + game.floorNum + "  \u00b7  Map", VIEW_W / 2, 34);
+  ctx.font = "12px monospace";
+  ctx.fillStyle = "#9c9486";
+  ctx.fillText("M to close  \u00b7  the game is NOT paused", VIEW_W / 2, VIEW_H - 28);
+}
+
 function drawHud(ctx, game) {
   const p = game.player;
   for (let i = 0; i < PLAYER_MAX_HP; i++) {
@@ -1786,8 +1856,8 @@ function drawHud(ctx, game) {
   ctx.font = "12px monospace";
   const hint = game.area === "arena"
     ? "Test arena  |  Skeleton difficulty " + game.difficulty.toFixed(2) + " (keys 1-5)  |  T: back to the maze"
-    : "T: skeleton test arena";
-  ctx.fillText(hint, VIEW_W / 2, VIEW_H - 10);
+    : "M: map  \u00b7  T: skeleton test arena";
+  if (!game.mapOpen) ctx.fillText(hint, VIEW_W / 2, VIEW_H - 10);
 
   if (game.over) {
     ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
@@ -1819,6 +1889,7 @@ function draw(ctx, game, time) {
   drawLighting(ctx, game, cam);
   drawSpeech(ctx, game, cam);
   ctx.restore();                           // ...screen space from here
+  drawMap(ctx, game, time);
   drawHud(ctx, game);
 }
 
@@ -1848,6 +1919,11 @@ if (typeof window !== "undefined" && typeof document !== "undefined" && document
     if (e.code === "KeyR" && game.over) {
       // Back to the checkpoint: the safe room, full health, same floor.
       respawnAtCheckpoint(game);
+      return;
+    }
+    if (e.code === "KeyM") {
+      toggleMap(game);
+      e.preventDefault();
       return;
     }
     if (e.code === "KeyT" && !game.over) {
