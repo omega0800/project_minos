@@ -481,7 +481,8 @@ console.log("Maze generation");
     }
     return g;
   }
-  let allFull = true, allTree = true, allConnected = true, allSealed = true, minBuilt = Infinity, maxForced = 0;
+  let allFull = true, allConnected = true, allSealed = true, minBuilt = Infinity, maxForced = 0;
+  let loopsTotal = 0, loopsMax = 0, cellsTotal = 0, hallsTotal = 0, hallsOk = true, oneWide = 0;
   for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) {
     const g = exploreAll(seed), r = g.room, W = r.cellsW, H = r.cellsH;
     let reserved = 0, empty = 0, openEdges = 0;
@@ -497,8 +498,25 @@ console.log("Maze generation");
       }
     }
     if (empty !== 0) allFull = false;
-    // A tree (safe room counted as one node): exactly one way into every built cell.
-    if (openEdges !== r.builtCount) allTree = false;
+    // Loops = open walls beyond the one way into each cell (safe room counted as one node).
+    const loops = openEdges - r.builtCount;
+    loopsTotal += loops; loopsMax = Math.max(loopsMax, loops); cellsTotal += r.builtCount;
+    // Wide halls: 2 cells wide, 3-5 long, fully open inside (no pillars).
+    for (const hall of r.wideHalls) {
+      hallsTotal++;
+      if (hall.length < 6 || hall.length > 10) hallsOk = false;
+      const xs = hall.map((c) => c[0]), ys = hall.map((c) => c[1]);
+      const x0 = Math.min(...xs) * 3 + 1, x1 = (Math.max(...xs) + 1) * 3 - 1;
+      const y0 = Math.min(...ys) * 3 + 1, y1 = (Math.max(...ys) + 1) * 3 - 1;
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) if (!G.isWalkable(G.tileAt(r, x, y))) hallsOk = false;
+      if (Math.min(x1 - x0, y1 - y0) + 1 !== 5) hallsOk = false;
+    }
+    // No 1-tile-wide passages: no walkable tile has something solid on both sides.
+    for (let y = 0; y < r.h; y++) for (let x = 0; x < r.w; x++) {
+      if (!G.isWalkable(G.tileAt(r, x, y))) continue;
+      const sol = (dx, dy) => !G.isWalkable(G.tileAt(r, x + dx, y + dy));
+      if ((sol(-1, 0) && sol(1, 0)) || (sol(0, -1) && sol(0, 1))) oneWide++;
+    }
     // Everything reachable from the safe room.
     const seen = new Uint8Array(W * H), q = [];
     for (let i = 0; i < W * H; i++) if (r.cells[i] === G.CELL_RESERVED) { seen[i] = 1; q.push(i); }
@@ -521,7 +539,13 @@ console.log("Maze generation");
     maxForced = Math.max(maxForced, r.forcedCount || 0);
   }
   check("8 floors explored fully: every cell gets built (never traps you)", allFull, "smallest=" + minBuilt);
-  check("no loops yet: the maze is a tree", allTree);
+  console.log("        (loops: " + loopsTotal + " over 8 floors, at most " + loopsMax + " on one; " + (100 * loopsTotal / cellsTotal).toFixed(1) + "% of cells)");
+  check("the maze has some loops", loopsTotal > 0);
+  check("loops stay limited (under 10% of cells)", loopsTotal / cellsTotal < 0.1);
+  console.log("        (wide halls: " + hallsTotal + " over 8 floors)");
+  check("wide halls appear", hallsTotal > 0);
+  check("wide halls are 5 tiles wide, 3-5 cells long, open inside", hallsOk);
+  check("no 1-tile-wide passages anywhere", oneWide === 0, oneWide + " tiles");
   check("every cell is reachable from the safe room", allConnected);
   check("everything walkable is walled in", allSealed);
   console.log("        (anti-trap opened a wall at most " + maxForced + " times on one floor)");
@@ -585,7 +609,8 @@ console.log("Walking the maze (never see it being built)");
     }
   }
   const total = r.cellsW * r.cellsH - 42;
-  console.log("        (bot walked " + (steps * G.STEP).toFixed(0) + " s of game time, built " + r.builtCount + "/" + total + " cells)");
+  console.log("        (bot walked " + (steps * G.STEP).toFixed(0) + " s of game time, built " + r.builtCount + "/" + total +
+    " cells; " + r.loopCount + " loops, " + r.wideHalls.length + " wide halls)");
   check("walking bot explores the whole floor", r.frontier.length === 0 && r.builtCount === total);
   check("never sees unbuilt space (no void inside the torchlight)", sawVoid === 0, sawVoid + " times");
   check("no tile you've seen ever changes (no walls popping open)", popped === 0, popped + " tiles");

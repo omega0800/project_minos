@@ -38,6 +38,9 @@ const FLOOR_CELLS = 31;     // floor size in cells for now (31 x 31 cells = 94 x
 
 // Maze generation
 const BRANCH_CHANCE = 0.4;  // chance each side of a new cell opens into untouched space (q)
+const LOOP_CHANCE = 0.06;   // chance a side opens into an already-reachable cell, making a loop (p)
+const WIDE_HALL_CHANCE = 0.025; // chance a new cell starts a wide hall instead
+const WIDE_HALL_MIN = 3, WIDE_HALL_MAX = 5; // wide hall length in cells (always 2 cells = 5 tiles wide)
 
 // Torchlight
 const TORCH_RADIUS = 6.5 * TILE;  // you can see this far (blocked by walls)
@@ -301,6 +304,8 @@ function initCells(room) {
   room.edgeV = new Int8Array(W * (H - 1)).fill(EDGE_UNDECIDED); // between (cx,cy) and (cx,cy+1)
   room.frontier = [];                                     // [{ cx, cy, from: {cx, cy, dir} }]
   room.builtCount = 0;
+  room.loopCount = 0;
+  room.wideHalls = [];                                    // each is a list of [cx, cy]
   room.seen = new Uint8Array(room.w * room.h);            // tiles you've ever seen
   room.visible = new Uint8Array(room.w * room.h);         // tiles you can see right now
   room.visList = [];
@@ -335,7 +340,10 @@ function setEdge(room, cx, cy, dir, v) {
 function cellState(room, cx, cy) { return room.cells[cy * room.cellsW + cx]; }
 
 // Put an ungenerated cell on the frontier, reached through (fromCx, fromCy, dir).
+// A cell already on the frontier isn't added twice (a second open wall into
+// it is a loop; it gets carved when the cell is built).
 function claim(room, cx, cy, fromCx, fromCy, dir) {
+  if (room.claimed[cy * room.cellsW + cx]) return;
   room.claimed[cy * room.cellsW + cx] = 1;
   room.frontier.push({ cx, cy, from: { cx: fromCx, cy: fromCy, dir } });
 }
@@ -344,7 +352,20 @@ function cellCentre(cx, cy) {
   return { x: (cx * CELL + 2) * TILE, y: (cy * CELL + 2) * TILE };
 }
 
-// Walls go up only around the new cell (the rest of the floor is unchanged).
+// The two wall tiles between a cell and its neighbour.
+function edgeTiles(cx, cy, dir) {
+  const bx = cx * CELL, by = cy * CELL;
+  if (dir === "n") return [[bx + 1, by], [bx + 2, by]];
+  if (dir === "s") return [[bx + 1, by + CELL], [bx + 2, by + CELL]];
+  if (dir === "w") return [[bx, by + 1], [bx, by + 2]];
+  return [[bx + CELL, by + 1], [bx + CELL, by + 2]];
+}
+
+function edgeEverSeen(room, cx, cy, dir) {
+  return edgeTiles(cx, cy, dir).some(([x, y]) => room.seen[y * room.w + x]);
+}
+
+// Walls go up only around the given cell (the rest of the floor is unchanged).
 function wallUpAround(room, cx, cy) {
   const x0 = cx * CELL - 1, y0 = cy * CELL - 1;
   for (let y = y0; y <= y0 + CELL + 2; y++)
@@ -358,37 +379,73 @@ function wallUpAround(room, cx, cy) {
     }
 }
 
-// Build one frontier cell: carve it, open the way in, and decide its other sides.
-function buildCell(game, entry) {
-  const room = game.room, rng = game.rng;
-  const { cx, cy, from } = entry;
-  room.frontier = room.frontier.filter((f) => f !== entry);
+function shuffled(arr, rng) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+
+// Mark a cell built and carve it, plus every already-open wall between it and
+// built cells or the safe room (the way in, and any loops waiting on it).
+function markBuilt(room, cx, cy) {
   room.claimed[cy * room.cellsW + cx] = 0;
   room.cells[cy * room.cellsW + cx] = CELL_BUILT;
   room.builtCount++;
   carveCell(room, cx, cy);
-  openEdge(room, from.cx, from.cy, from.dir);
+}
 
-  // Decide the other sides, in random order.
-  const dirs = DIRS.slice();
-  for (let i = dirs.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [dirs[i], dirs[j]] = [dirs[j], dirs[i]]; }
-  const openable = []; // sides that lead into untouched space
-  for (const d of dirs) {
+function carveOpenEdges(room, cx, cy) {
+  for (const d of DIRS) {
     const n = neighbour(room, cx, cy, d);
-    if (!n || getEdge(room, cx, cy, d) !== EDGE_UNDECIDED) continue;
-    const untouched = cellState(room, n.cx, n.cy) === CELL_EMPTY && !room.claimed[n.cy * room.cellsW + n.cx];
-    if (untouched) openable.push({ d, n });
-    if (untouched && rng() < BRANCH_CHANCE) {
+    if (!n || getEdge(room, cx, cy, d) !== EDGE_OPEN) continue;
+    if (cellState(room, n.cx, n.cy) !== CELL_EMPTY) openEdge(room, cx, cy, d);
+  }
+}
+
+// Decide a freshly built cell's undecided sides. Returns the sides that lead
+// into untouched space (for the sealing check).
+function decideSides(game, cx, cy) {
+  const room = game.room, rng = game.rng, W = room.cellsW;
+  const openable = [];
+  for (const d of shuffled(DIRS, rng)) {
+    const n = neighbour(room, cx, cy, d);
+    if (!n) continue;
+    const st = cellState(room, n.cx, n.cy), claimed = room.claimed[n.cy * W + n.cx];
+    const e = getEdge(room, cx, cy, d);
+    if (st === CELL_BUILT && e === EDGE_WALL) {
+      // Loop into a built cell, but only through a wall you've never seen.
+      if (!edgeEverSeen(room, cx, cy, d) && rng() < LOOP_CHANCE) {
+        setEdge(room, cx, cy, d, EDGE_OPEN);
+        openEdge(room, cx, cy, d);
+        room.loopCount++;
+      }
+      continue;
+    }
+    if (e !== EDGE_UNDECIDED) continue;
+    if (st === CELL_EMPTY && !claimed) {
+      openable.push({ d, n });
+      if (rng() < BRANCH_CHANCE) {
+        setEdge(room, cx, cy, d, EDGE_OPEN);
+        claim(room, n.cx, n.cy, cx, cy, d);
+      } else {
+        setEdge(room, cx, cy, d, EDGE_WALL);
+      }
+    } else if (st === CELL_EMPTY && claimed && rng() < LOOP_CHANCE) {
+      // Loop into a cell that's already waiting to be built.
       setEdge(room, cx, cy, d, EDGE_OPEN);
-      claim(room, n.cx, n.cy, cx, cy, d);
+      room.loopCount++;
     } else {
-      setEdge(room, cx, cy, d, EDGE_WALL); // no loops yet: never open into built or claimed cells
+      setEdge(room, cx, cy, d, EDGE_WALL);
     }
   }
+  return openable;
+}
 
-  // Never seal off untouched space: if walling a side would leave the space
-  // behind it with no other way in, open this side instead. (This cell is
-  // being built out of sight, so the opening is never one you've seen.)
+// Never seal off untouched space: if a wall leaves the space behind it with
+// no other way in, open it instead. (New cells are built out of sight, so the
+// opening is never one you've seen.)
+function keepReachable(game, cx, cy, openable) {
+  const room = game.room;
   for (const { d, n } of openable) {
     if (getEdge(room, cx, cy, d) === EDGE_OPEN) continue;
     if (room.claimed[n.cy * room.cellsW + n.cx] || cellState(room, n.cx, n.cy) !== CELL_EMPTY) continue;
@@ -397,18 +454,82 @@ function buildCell(game, entry) {
       claim(room, n.cx, n.cy, cx, cy, d);
     }
   }
+}
+
+// Build one frontier cell (or, sometimes, a wide hall starting there).
+function buildCell(game, entry) {
+  const room = game.room, rng = game.rng;
+  room.frontier = room.frontier.filter((f) => f !== entry);
+  let block = null;
+  if (rng() < WIDE_HALL_CHANCE) block = planWideHall(game, entry);
+  if (!block) block = [[entry.cx, entry.cy]];
+
+  for (const [x, y] of block) markBuilt(room, x, y);
+  if (block.length > 1) mergeBlock(room, block);
+  for (const [x, y] of block) carveOpenEdges(room, x, y);
+  if (block.length > 1) room.wideHalls.push(block);
+
+  const openable = [];
+  for (const [x, y] of block) {
+    const o = decideSides(game, x, y);
+    for (const s of o) openable.push({ cx: x, cy: y, d: s.d, n: s.n });
+  }
+  for (const o of openable) keepReachable(game, o.cx, o.cy, [o]);
 
   // Backstop: never let the maze close off while untouched space remains.
   if (room.frontier.length === 0) {
-    if (openable.length > 0) {
-      const pick = openable[Math.floor(rng() * openable.length)];
-      setEdge(room, cx, cy, pick.d, EDGE_OPEN);
-      claim(room, pick.n.cx, pick.n.cy, cx, cy, pick.d);
+    const still = openable.filter((o) => cellState(room, o.n.cx, o.n.cy) === CELL_EMPTY && !room.claimed[o.n.cy * room.cellsW + o.n.cx]);
+    if (still.length > 0) {
+      const pick = still[Math.floor(rng() * still.length)];
+      setEdge(room, pick.cx, pick.cy, pick.d, EDGE_OPEN);
+      claim(room, pick.n.cx, pick.n.cy, pick.cx, pick.cy, pick.d);
     } else {
       forceOpening(game);
     }
   }
-  wallUpAround(room, cx, cy);
+  for (const [x, y] of block) wallUpAround(room, x, y);
+}
+
+// ---------- Blocks of merged cells (wide halls now, rooms later) ----------
+// Open every wall between cells of the block and remove the pillars where
+// four block cells meet, so the block is one open space.
+function mergeBlock(room, block) {
+  const inBlock = new Set(block.map(([x, y]) => y * room.cellsW + x));
+  const has = (x, y) => inBlock.has(y * room.cellsW + x);
+  for (const [x, y] of block) {
+    for (const d of ["e", "s"]) {
+      const n = neighbour(room, x, y, d);
+      if (n && has(n.cx, n.cy)) { setEdge(room, x, y, d, EDGE_OPEN); openEdge(room, x, y, d); }
+    }
+    if (has(x + 1, y) && has(x, y + 1) && has(x + 1, y + 1))
+      setTile(room, (x + 1) * CELL, (y + 1) * CELL, FLOOR);
+  }
+}
+
+// A wide hall: 2 cells wide and 3-5 long, running straight on from the way in.
+// Every cell it needs must be untouched. Returns its cells, or null.
+function planWideHall(game, entry) {
+  const room = game.room, rng = game.rng, W = room.cellsW;
+  const dir = entry.from.dir;
+  const [fx, fy] = DIR_STEP[dir];
+  const sides = shuffled(dir === "n" || dir === "s" ? ["e", "w"] : ["n", "s"], rng);
+  const free = (x, y) => x >= 0 && y >= 0 && x < W && y < room.cellsH &&
+    cellState(room, x, y) === CELL_EMPTY && !room.claimed[y * W + x];
+  for (let len = WIDE_HALL_MIN + Math.floor(rng() * (WIDE_HALL_MAX - WIDE_HALL_MIN + 1)); len >= WIDE_HALL_MIN; len--) {
+    for (const side of sides) {
+      const [sx, sy] = DIR_STEP[side];
+      const cells = [];
+      let ok = true;
+      for (let i = 0; i < len && ok; i++) {
+        const ax = entry.cx + fx * i, ay = entry.cy + fy * i;
+        const bx = ax + sx, by = ay + sy;
+        if (!(i === 0 || free(ax, ay)) || !free(bx, by)) ok = false;
+        cells.push([ax, ay], [bx, by]);
+      }
+      if (ok) return cells;
+    }
+  }
+  return null;
 }
 
 // Is the patch of untouched cells containing (cx, cy) next to a frontier cell?
