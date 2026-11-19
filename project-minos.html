@@ -24,8 +24,17 @@
 // Config
 // ============================================================
 const TILE = 32;            // pixels per tile
-const ROOM_W = 30;          // room width in tiles  (30 * 32 = 960)
-const ROOM_H = 20;          // room height in tiles (20 * 32 = 640)
+const VIEW_W = 960;         // screen size in pixels
+const VIEW_H = 640;
+const ROOM_W = 30;          // test arena size in tiles (exactly one screen)
+const ROOM_H = 20;
+
+// Maze floors are built on a grid of cells. A cell is CELL x CELL tiles: a
+// 2x2 floor patch plus the wall line it shares with its neighbours, so every
+// hallway is 2 tiles wide. Cell (cx, cy) has floor tiles
+// (3cx+1 .. 3cx+2, 3cy+1 .. 3cy+2); walls sit on multiples of 3.
+const CELL = 3;
+const FLOOR_CELLS = 31;     // floor size in cells for now (31 x 31 cells = 94 x 94 tiles)
 const STEP = 1 / 60;        // fixed simulation step, seconds
 
 const PLAYER_SIZE = 22;     // player hitbox, pixels (square)
@@ -102,13 +111,12 @@ const FLOOR = 0;
 const WALL = 1;
 const VOID = 2;   // solid emptiness outside a room (drawn black)
 const HEAL = 3;   // aquamarine floor: standing on it heals
-const DOOR = 4;   // solid for now: the maze isn't built yet
+const DOOR = 4;   // open doorway (walkable)
 const NPC = 5;    // the tile the NPC stands on (solid)
 
 // Safe room
 const HEAL_INTERVAL = 0.5;        // seconds per 1 HP healed while on a heal tile
 const NPC_TALK_RANGE = 80;        // NPC speaks when the player is this close (center to center)
-const DOOR_MSG_TIME = 1.6;        // how long the "door won't open" message shows
 
 // What the NPC says. He picks from the deepest group the player has reached
 // (by deepest floor), and moves to a new line each time you walk up to him.
@@ -164,31 +172,104 @@ function tileAt(room, tx, ty) {
 
 function isSolid(room, tx, ty) {
   const t = tileAt(room, tx, ty);
-  return t === WALL || t === VOID || t === DOOR || t === NPC;
+  return t === WALL || t === VOID || t === NPC;
 }
 
-// The safe room: an 18x12 room in the middle of the screen, with a healing
-// nook set into the top wall, a 2-wide door in the bottom wall and the NPC.
-// Returned room also records where those things are.
-function makeSafeRoom() {
-  const w = ROOM_W, h = ROOM_H;
-  const tiles = new Uint8Array(w * h).fill(VOID);
-  const set = (x, y, t) => { tiles[y * w + x] = t; };
-  const x0 = 6, x1 = 23, y0 = 4, y1 = 15;            // floor area (inclusive)
-  for (let y = y0 - 1; y <= y1 + 1; y++)
-    for (let x = x0 - 1; x <= x1 + 1; x++)
-      set(x, y, x < x0 || x > x1 || y < y0 || y > y1 ? WALL : FLOOR);
-  // Healing nook: 4 wide, 2 deep, cut into the top wall, walls around it.
-  for (let y = 1; y <= 3; y++)
-    for (let x = 12; x <= 17; x++)
-      set(x, y, x === 12 || x === 17 || y === 1 ? WALL : HEAL);
-  // Door: 2 tiles wide (hallway width) in the bottom wall.
-  set(14, y1 + 1, DOOR);
-  set(15, y1 + 1, DOOR);
-  // NPC stands to the right of center.
-  const npc = { tx: 19, ty: 8 };
-  set(npc.tx, npc.ty, NPC);
-  return { w, h, tiles, npc };
+function isWalkable(t) {
+  return t === FLOOR || t === HEAL || t === DOOR;
+}
+
+// ---------- Maze floors ----------
+// A floor is a big tile map (mostly VOID = unexplored) built from cells.
+function makeFloorGrid(cellsW, cellsH) {
+  const w = cellsW * CELL + 1, h = cellsH * CELL + 1;
+  return { w, h, cellsW, cellsH, tiles: new Uint8Array(w * h).fill(VOID) };
+}
+
+function setTile(room, x, y, t) {
+  if (x >= 0 && y >= 0 && x < room.w && y < room.h) room.tiles[y * room.w + x] = t;
+}
+
+// Make a cell's 2x2 patch walkable.
+function carveCell(room, cx, cy) {
+  for (let dy = 1; dy <= 2; dy++)
+    for (let dx = 1; dx <= 2; dx++) setTile(room, cx * CELL + dx, cy * CELL + dy, FLOOR);
+}
+
+// Open the wall between a cell and its neighbour (dir: "n", "s", "e" or "w").
+function openEdge(room, cx, cy, dir) {
+  const bx = cx * CELL, by = cy * CELL;
+  if (dir === "n") { setTile(room, bx + 1, by, FLOOR); setTile(room, bx + 2, by, FLOOR); }
+  if (dir === "s") { setTile(room, bx + 1, by + CELL, FLOOR); setTile(room, bx + 2, by + CELL, FLOOR); }
+  if (dir === "w") { setTile(room, bx, by + 1, FLOOR); setTile(room, bx, by + 2, FLOOR); }
+  if (dir === "e") { setTile(room, bx + CELL, by + 1, FLOOR); setTile(room, bx + CELL, by + 2, FLOOR); }
+}
+
+// Every VOID tile touching walkable ground (including diagonally) becomes wall.
+function wallUp(room) {
+  for (let y = 0; y < room.h; y++)
+    for (let x = 0; x < room.w; x++) {
+      if (tileAt(room, x, y) !== VOID) continue;
+      let touches = false;
+      for (let dy = -1; dy <= 1 && !touches; dy++)
+        for (let dx = -1; dx <= 1 && !touches; dx++) {
+          const t = tileAt(room, x + dx, y + dy);
+          if (isWalkable(t) || t === NPC) touches = true;
+        }
+      if (touches) setTile(room, x, y, WALL);
+    }
+}
+
+// Floor 1: the safe room sits in the middle of the floor, filling a block of
+// 7 x 6 cells. It has a healing nook in its top wall, the Old Man, and a
+// 2-wide doorway in its bottom wall that lines up with the cell below it, so
+// the maze can grow from there.
+function makeFirstFloor() {
+  const room = makeFloorGrid(FLOOR_CELLS, FLOOR_CELLS);
+  const c = Math.floor(FLOOR_CELLS / 2);                 // centre cell (15)
+  const bx0 = (c - 3) * CELL, by0 = (c - 3) * CELL;      // safe block's top-left tile
+  // Room floor: 20 x 14 tiles.
+  const fx0 = bx0 + 1, fx1 = bx0 + 7 * CELL - 1;
+  const fy0 = by0 + 4, fy1 = by0 + 6 * CELL - 1;
+  for (let y = fy0; y <= fy1; y++) for (let x = fx0; x <= fx1; x++) setTile(room, x, y, FLOOR);
+  // Healing nook: 4 wide, 2 deep, cut into the top wall.
+  const mid = c * CELL + 1;                              // left floor column of the centre cell
+  for (let y = fy0 - 2; y <= fy0 - 1; y++)
+    for (let x = mid - 1; x <= mid + 2; x++) setTile(room, x, y, HEAL);
+  // Doorway in the bottom wall, lined up with the centre cell's columns.
+  const doorY = fy1 + 1;
+  setTile(room, mid, doorY, DOOR);
+  setTile(room, mid + 1, doorY, DOOR);
+  // The Old Man, right of centre.
+  const npc = { tx: fx0 + 13, ty: fy0 + 4 };
+  setTile(room, npc.tx, npc.ty, NPC);
+
+  // Step 1 stand-in for the maze: a short hand-built corridor out of the door.
+  const doorCellY = c + 3;                               // the cell just below the door
+  const path = [[c, doorCellY], [c, doorCellY + 1], [c, doorCellY + 2], [c + 1, doorCellY + 2],
+                [c + 2, doorCellY + 2], [c + 2, doorCellY + 3], [c + 2, doorCellY + 4],
+                [c - 1, doorCellY + 2], [c - 2, doorCellY + 2], [c - 3, doorCellY + 2], [c - 3, doorCellY + 1]];
+  for (const [x, y] of path) carveCell(room, x, y);
+  const links = [[c, doorCellY, "s"], [c, doorCellY + 1, "s"], [c, doorCellY + 2, "e"], [c + 1, doorCellY + 2, "e"],
+                 [c + 2, doorCellY + 2, "s"], [c + 2, doorCellY + 3, "s"],
+                 [c, doorCellY + 2, "w"], [c - 1, doorCellY + 2, "w"], [c - 2, doorCellY + 2, "w"], [c - 3, doorCellY + 2, "n"]];
+  for (const [x, y, d] of links) openEdge(room, x, y, d);
+
+  wallUp(room);
+  room.npc = npc;
+  room.safeRect = { x0: fx0, y0: fy0 - 2, x1: fx1, y1: fy1 };   // tiles, inclusive
+  room.healTile = { tx: mid, ty: fy0 - 1 };
+  room.door = { tx: mid, ty: doorY };
+  room.spawn = { x: ((fx0 + fx1 + 1) / 2) * TILE, y: ((fy0 + fy1 + 1) / 2) * TILE }; // pixel centre
+  return room;
+}
+
+function inSafeRoom(game) {
+  const r = game.room.safeRect;
+  if (!r) return false;
+  const c = centerOf(game.player);
+  const tx = Math.floor(c.x / TILE), ty = Math.floor(c.y / TILE);
+  return tx >= r.x0 && tx <= r.x1 && ty >= r.y0 && ty <= r.y1;
 }
 
 // Does a box at (x, y) of the given size overlap any solid tile?
@@ -297,10 +378,11 @@ function applyKnockback(room, ent, dt) {
 // ============================================================
 function makePlayer(room) {
   // Start in the middle of the room. x, y = top-left of the hitbox.
+  const spawn = room.spawn || { x: (room.w * TILE) / 2, y: (room.h * TILE) / 2 };
   return {
     id: "player",
-    x: (room.w * TILE) / 2 - PLAYER_SIZE / 2,
-    y: (room.h * TILE) / 2 - PLAYER_SIZE / 2,
+    x: spawn.x - PLAYER_SIZE / 2,
+    y: spawn.y - PLAYER_SIZE / 2,
     size: PLAYER_SIZE,
     hp: PLAYER_MAX_HP,
     iframes: 0,             // >0: can't be hurt
@@ -554,21 +636,22 @@ function playerAttacks(game) {
 // ============================================================
 // Game state
 // ============================================================
-// Areas: "safe" (the safe room, where the game starts) and "arena" (the
-// open room with skeleton waves, kept for testing combat until the maze exists).
-// opts.area: which area to start in (default "safe")
+// Areas: "maze" (maze floor 1, with the safe room at its centre, where the game
+// starts) and "arena" (the one-screen room with skeleton waves, kept for
+// testing combat until the maze has enemies).
+// opts.area: which area to start in (default "maze")
 // opts.skeletons === false: no skeleton waves in the arena (used by movement tests)
 function makeGame(seed, opts) {
-  const area = (opts && opts.area) || "safe";
-  const room = area === "safe" ? makeSafeRoom() : makeRoom(ROOM_W, ROOM_H);
+  const area = (opts && opts.area) || "maze";
+  const room = area === "maze" ? makeFirstFloor() : makeRoom(ROOM_W, ROOM_H);
   const game = {
     area,
     room,
     player: makePlayer(room),
+    floorNum: 1,           // current maze floor
     deepestFloor: 0,       // deepest maze floor reached (picks the NPC's lines)
     npcTalking: false,     // player is near the NPC right now
     npcLine: -1,           // index into the current line group
-    doorMsg: 0,            // >0 while "the door won't open" shows
     healTimer: 0,
     skeletons: [],
     effects: [],
@@ -584,18 +667,17 @@ function makeGame(seed, opts) {
   return game;
 }
 
-// Testing: hop between the safe room and the arena (key T). Keeps your HP.
+// Testing: hop between the maze and the arena (key T). Keeps your HP.
 function switchArea(game) {
   const hp = game.player.hp;
-  game.area = game.area === "safe" ? "arena" : "safe";
-  game.room = game.area === "safe" ? makeSafeRoom() : makeRoom(ROOM_W, ROOM_H);
+  game.area = game.area === "maze" ? "arena" : "maze";
+  game.room = game.area === "maze" ? makeFirstFloor() : makeRoom(ROOM_W, ROOM_H);
   game.player = makePlayer(game.room);
   game.player.hp = hp;
   game.skeletons = [];
   game.effects = [];
   game.waveTimer = 0;
   game.npcTalking = false;
-  game.doorMsg = 0;
   if (game.area === "arena" && game.waves) spawnWave(game, WAVE_SIZE);
 }
 
@@ -636,15 +718,6 @@ function updateSafeRoom(game, dt) {
     }
     game.npcTalking = near;
   }
-
-  // Door: pushing against it shows a message.
-  if (game.doorMsg > 0) game.doorMsg = Math.max(0, game.doorMsg - dt);
-  const pad = 2; // touching = within 2 px
-  const x0 = Math.floor((p.x - pad) / TILE), x1 = Math.floor((p.x + p.size + pad) / TILE);
-  const y0 = Math.floor((p.y - pad) / TILE), y1 = Math.floor((p.y + p.size + pad) / TILE);
-  for (let ty = y0; ty <= y1; ty++)
-    for (let tx = x0; tx <= x1; tx++)
-      if (tileAt(room, tx, ty) === DOOR) game.doorMsg = DOOR_MSG_TIME;
 }
 
 // Testing helper: change skeleton difficulty and replace the current wave.
@@ -661,7 +734,7 @@ function stepGame(game, input, dt) {
     return;
   }
   updatePlayer(game.room, game.player, input, dt);
-  if (game.area === "safe") updateSafeRoom(game, dt);
+  if (game.area === "maze") updateSafeRoom(game, dt);
   playerAttacks(game);
   for (const sk of game.skeletons) updateSkeleton(game, sk, dt);
   separateSkeletons(game, dt);
@@ -682,9 +755,22 @@ function stepGame(game, input, dt) {
 // ============================================================
 // Drawing
 // ============================================================
-function drawRoom(ctx, room) {
-  for (let ty = 0; ty < room.h; ty++) {
-    for (let tx = 0; tx < room.w; tx++) {
+// Camera: keeps the player centred, but stops at the edges of the map.
+function cameraFor(game) {
+  const c = centerOf(game.player);
+  const maxX = Math.max(0, game.room.w * TILE - VIEW_W);
+  const maxY = Math.max(0, game.room.h * TILE - VIEW_H);
+  return {
+    x: Math.round(Math.min(maxX, Math.max(0, c.x - VIEW_W / 2))),
+    y: Math.round(Math.min(maxY, Math.max(0, c.y - VIEW_H / 2))),
+  };
+}
+
+function drawRoom(ctx, room, cam) {
+  const tx0 = Math.max(0, Math.floor(cam.x / TILE)), tx1 = Math.min(room.w - 1, Math.floor((cam.x + VIEW_W) / TILE));
+  const ty0 = Math.max(0, Math.floor(cam.y / TILE)), ty1 = Math.min(room.h - 1, Math.floor((cam.y + VIEW_H) / TILE));
+  for (let ty = ty0; ty <= ty1; ty++) {
+    for (let tx = tx0; tx <= tx1; tx++) {
       const t = tileAt(room, tx, ty);
       const px = tx * TILE, py = ty * TILE;
       if (t === WALL) {
@@ -699,13 +785,12 @@ function drawRoom(ctx, room) {
         ctx.fillStyle = (tx + ty) % 2 === 0 ? "#3fbf9f" : "#47c9a8";
         ctx.fillRect(px, py, TILE, TILE);
       } else if (t === DOOR) {
-        ctx.fillStyle = "#5c3d22";
+        // Open doorway: worn stone threshold.
+        ctx.fillStyle = "#3a332b";
         ctx.fillRect(px, py, TILE, TILE);
-        ctx.fillStyle = "#47301b";
-        for (let i = 0; i < 4; i++) ctx.fillRect(px + 2 + i * 8, py + 2, 2, TILE - 4); // planks
-        ctx.fillStyle = "#2c2c34";
-        ctx.fillRect(px, py, TILE, 3);                                                // lintel
-        ctx.fillRect(px, py + 13, TILE, 3);                                           // iron band
+        ctx.fillStyle = "#4a4136";
+        ctx.fillRect(px, py + 4, TILE, 4);
+        ctx.fillRect(px, py + TILE - 8, TILE, 4);
       } else {
         // Subtle checker so movement is easy to see.
         ctx.fillStyle = (tx + ty) % 2 === 0 ? "#26221e" : "#2b2621";
@@ -717,9 +802,11 @@ function drawRoom(ctx, room) {
 
 // Soft shimmer over the heal tiles so the nook reads as special.
 function drawHealGlow(ctx, room, time) {
+  const r = room.safeRect;
+  if (!r) return;
   ctx.fillStyle = `rgba(160, 255, 230, ${0.08 + 0.06 * Math.sin(time * 2.5)})`;
-  for (let ty = 0; ty < room.h; ty++)
-    for (let tx = 0; tx < room.w; tx++)
+  for (let ty = r.y0; ty <= r.y1; ty++)
+    for (let tx = r.x0; tx <= r.x1; tx++)
       if (tileAt(room, tx, ty) === HEAL) ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
 }
 
@@ -757,7 +844,7 @@ function wrapText(ctx, text, maxW) {
   return lines;
 }
 
-function drawSpeech(ctx, game) {
+function drawSpeech(ctx, game, cam) {
   const room = game.room;
   if (!room.npc || !game.npcTalking || game.npcLine < 0) return;
   const text = npcLineGroup(game).lines[game.npcLine % npcLineGroup(game).lines.length];
@@ -767,7 +854,7 @@ function drawSpeech(ctx, game) {
   const w = Math.max(...lines.map((l) => ctx.measureText(l).width)) + padX * 2;
   const h = lines.length * lh + padY * 2;
   const cx = room.npc.tx * TILE + TILE / 2;
-  let bx = Math.min(Math.max(cx - w / 2, 8), ROOM_W * TILE - w - 8);
+  let bx = Math.min(Math.max(cx - w / 2, cam.x + 8), cam.x + VIEW_W - w - 8);
   const by = room.npc.ty * TILE - h - 16;
   ctx.fillStyle = "rgba(20, 16, 28, 0.92)";
   ctx.fillRect(bx, by, w, h);
@@ -899,38 +986,35 @@ function drawHud(ctx, game) {
   ctx.fillStyle = "#cfc6b8";
   ctx.font = "14px monospace";
   ctx.textAlign = "right";
-  if (game.area === "arena") ctx.fillText("Skeletons slain: " + game.kills, ROOM_W * TILE - 12, 21);
-  else ctx.fillText("Safe room", ROOM_W * TILE - 12, 21);
+  if (game.area === "arena") ctx.fillText("Skeletons slain: " + game.kills, VIEW_W - 12, 21);
+  else ctx.fillText("Floor " + game.floorNum + (inSafeRoom(game) ? "  \u00b7  Safe room" : ""), VIEW_W - 12, 21);
   ctx.textAlign = "center";
   ctx.fillStyle = "#9c9486";
   ctx.font = "12px monospace";
   const hint = game.area === "arena"
-    ? "Test arena  |  Skeleton difficulty " + game.difficulty.toFixed(2) + " (keys 1-5)  |  T: back to safe room"
-    : "T: test arena (until the maze exists)";
-  ctx.fillText(hint, (ROOM_W * TILE) / 2, ROOM_H * TILE - 10);
-
-  if (game.doorMsg > 0) {
-    ctx.globalAlpha = Math.min(1, game.doorMsg / 0.4);
-    ctx.fillStyle = "#e8dcc4";
-    ctx.font = "16px monospace";
-    ctx.fillText("The door won't budge. Not yet.", (ROOM_W * TILE) / 2, 17 * TILE + 22);
-    ctx.globalAlpha = 1;
-  }
+    ? "Test arena  |  Skeleton difficulty " + game.difficulty.toFixed(2) + " (keys 1-5)  |  T: back to the maze"
+    : "T: test arena (until the maze has enemies)";
+  ctx.fillText(hint, VIEW_W / 2, VIEW_H - 10);
 
   if (game.over) {
     ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
-    ctx.fillRect(0, 0, ROOM_W * TILE, ROOM_H * TILE);
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
     ctx.textAlign = "center";
     ctx.fillStyle = "#e8dcc4";
     ctx.font = "40px monospace";
-    ctx.fillText("You died", (ROOM_W * TILE) / 2, (ROOM_H * TILE) / 2 - 10);
+    ctx.fillText("You died", VIEW_W / 2, VIEW_H / 2 - 10);
     ctx.font = "16px monospace";
-    ctx.fillText("Press R to return to the safe room", (ROOM_W * TILE) / 2, (ROOM_H * TILE) / 2 + 24);
+    ctx.fillText("Press R to return to the safe room", VIEW_W / 2, VIEW_H / 2 + 24);
   }
 }
 
 function draw(ctx, game, time) {
-  drawRoom(ctx, game.room);
+  const cam = cameraFor(game);
+  ctx.fillStyle = "#0b0a0c";
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  ctx.save();
+  ctx.translate(-cam.x, -cam.y);          // world space from here...
+  drawRoom(ctx, game.room, cam);
   drawHealGlow(ctx, game.room, time || 0);
   drawNpc(ctx, game.room);
   for (const sk of game.skeletons) drawSkeleton(ctx, sk);
@@ -938,7 +1022,8 @@ function draw(ctx, game, time) {
   for (const sk of game.skeletons) drawSwing(ctx, sk, "rgba(255, 110, 80, 0.20)", "#f0c8b8");
   drawSwing(ctx, game.player, "rgba(230, 235, 255, 0.18)", "#e8ecf8");
   drawEffects(ctx, game);
-  drawSpeech(ctx, game);
+  drawSpeech(ctx, game, cam);
+  ctx.restore();                           // ...screen space from here
   drawHud(ctx, game);
 }
 

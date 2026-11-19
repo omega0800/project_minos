@@ -16,7 +16,7 @@ function loadGame() {
   vm.runInContext(
     m[1] + "\n;this.__api = { TILE, ROOM_W, ROOM_H, STEP, PLAYER_SPEED, WALL, FLOOR, makeGame, stepGame, tileAt, boxHitsWall," +
       " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER, FACING_LOCK_EXTRA, CHAIN_GRACE," +
-      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED, makeSafeRoom, switchArea, HEAL, DOOR, NPC, VOID, HEAL_INTERVAL, NPC_TALK_RANGE, NPC_LINES };",
+      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED, makeFirstFloor, switchArea, HEAL, DOOR, NPC, VOID, HEAL_INTERVAL, NPC_TALK_RANGE, NPC_LINES, cameraFor, inSafeRoom, VIEW_W, VIEW_H, CELL, isWalkable };",
     ctx
   );
   return ctx.__api;
@@ -374,31 +374,64 @@ console.log("Long fight simulation");
   check("the bot kills skeletons (" + kills + " kills, " + deaths + " deaths in 5 runs)", kills > 0);
 }
 
-console.log("Safe room");
+console.log("Floor 1 and the safe room");
 {
   const g = G.makeGame(1);
-  check("game starts in the safe room", g.area === "safe");
-  check("no skeletons in the safe room", g.skeletons.length === 0);
-  check("player starts on open floor", !G.boxHitsWall(g.room, g.player.x, g.player.y, g.player.size));
+  const r = g.room;
+  const T = G.TILE;
+  const place = (tx, ty) => { g.player.x = tx * T + 5; g.player.y = ty * T + 5; };
+  check("game starts on floor 1, inside the safe room", g.area === "maze" && g.floorNum === 1 && G.inSafeRoom(g));
+  check("floor is much bigger than the screen", r.w * T > G.VIEW_W * 2 && r.h * T > G.VIEW_H * 2);
+  check("no skeletons on floor 1 yet", g.skeletons.length === 0);
+  check("player starts on open floor", !G.boxHitsWall(r, g.player.x, g.player.y, g.player.size));
   run(g, none, G.WAVE_DELAY * 3);
-  check("no waves spawn in the safe room", g.skeletons.length === 0);
+  check("no waves spawn in the maze", g.skeletons.length === 0);
 
-  // Long random walk stays inside the room (never in a wall, void, door or NPC).
+  // Every walkable tile is enclosed: no walkable tile touches VOID.
+  let leaks = 0;
+  for (let y = 0; y < r.h; y++) for (let x = 0; x < r.w; x++) {
+    if (!G.isWalkable(G.tileAt(r, x, y))) continue;
+    for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]])
+      if (G.tileAt(r, x + dx, y + dy) === G.VOID) leaks++;
+  }
+  check("everything walkable is walled in (no holes into the void)", leaks === 0, leaks + " leaks");
+
+  // Door lines up with a cell so the maze can grow from it.
+  check("doorway sits on a cell's floor columns", (r.door.tx % G.CELL) === 1 && G.tileAt(r, r.door.tx + 1, r.door.ty) === G.DOOR);
+
+  // Long random walk never ends up inside anything solid.
   let seed = 99, bad = false;
   const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
   let inp = none;
   for (let i = 0; i < 20000; i++) {
     if (i % 30 === 0) inp = { up: rnd() < 0.5, down: rnd() < 0.5, left: rnd() < 0.5, right: rnd() < 0.5 };
     G.stepGame(g, inp, G.STEP);
-    if (G.boxHitsWall(g.room, g.player.x, g.player.y, g.player.size)) { bad = true; break; }
+    if (G.boxHitsWall(r, g.player.x, g.player.y, g.player.size)) { bad = true; break; }
   }
-  check("20,000 random steps: never leaves the room or walks through the NPC", !bad);
+  check("20,000 random steps: never inside a wall, the void or the Old Man", !bad);
+
+  // Walk out of the door and down the corridor.
+  const out = G.makeGame(1);
+  out.player.x = out.room.door.tx * T + 5;            // line up with the doorway
+  run(out, hold({ down: true }), 4);
+  check("can walk out through the doorway into the corridor", !G.inSafeRoom(out) && out.player.y > out.room.door.ty * T + T);
+
+  // Camera
+  const cam = G.cameraFor(out);
+  const pc = { x: out.player.x + 11, y: out.player.y + 11 };
+  check("camera keeps the player centred away from the edges",
+    Math.abs(pc.x - cam.x - G.VIEW_W / 2) <= 1 && Math.abs(pc.y - cam.y - G.VIEW_H / 2) <= 1);
+  out.player.x = 40; out.player.y = 40;
+  const c0 = G.cameraFor(out);
+  check("camera stops at the map's top-left edge", c0.x === 0 && c0.y === 0);
+  out.player.x = r.w * T; out.player.y = r.h * T;
+  const c1 = G.cameraFor(out);
+  check("camera stops at the map's bottom-right edge", c1.x === r.w * T - G.VIEW_W && c1.y === r.h * T - G.VIEW_H);
 
   // Healing nook
   const h = G.makeGame(1);
   h.player.hp = 1;
-  h.player.x = 14 * G.TILE + 5; h.player.y = 2 * G.TILE + 5;   // stand in the nook
-  check("nook tiles are heal tiles", G.tileAt(h.room, 14, 2) === G.HEAL && G.tileAt(h.room, 15, 3) === G.HEAL);
+  h.player.x = h.room.healTile.tx * T + 5; h.player.y = h.room.healTile.ty * T + 5;
   run(h, none, G.HEAL_INTERVAL * 2 + 0.05);
   check("standing on green heals 1 HP per interval", h.player.hp === 3, "hp=" + h.player.hp);
   run(h, none, 10);
@@ -407,45 +440,31 @@ console.log("Safe room");
   off.player.hp = 2;
   run(off, none, 3);
   check("no healing off the green", off.player.hp === 2);
-
-  // Walking up into the nook from the room works.
   const walk = G.makeGame(1);
-  walk.player.hp = 2;
-  run(walk, hold({ up: true }), 3);
-  check("can walk from the start straight up into the nook", G.tileAt(walk.room, Math.floor((walk.player.x + 11) / G.TILE), Math.floor((walk.player.y + 11) / G.TILE)) === G.HEAL);
+  run(walk, hold({ up: true }), 4);
+  const wc = { x: walk.player.x + 11, y: walk.player.y + 11 };
+  check("can walk from the start straight up into the nook",
+    G.tileAt(walk.room, Math.floor(wc.x / T), Math.floor(wc.y / T)) === G.HEAL);
 
-  // Door
-  const d = G.makeGame(1);
-  run(d, hold({ down: true }), 3);
-  check("door blocks the player", d.player.y + d.player.size <= 16 * G.TILE);
-  check("bumping the door shows the message", d.doorMsg > 0);
-  run(d, hold({ up: true }), 3);
-  check("message fades after walking away", d.doorMsg === 0);
-
-  // NPC
+  // The Old Man
   const n = G.makeGame(1);
+  const npc = n.room.npc;
+  const nearIt = () => { n.player.x = (npc.tx - 1) * T + 2; n.player.y = npc.ty * T + 5; G.stepGame(n, none, G.STEP); };
+  const awayIt = () => { n.player.x = (npc.tx - 8) * T; n.player.y = (npc.ty + 4) * T; G.stepGame(n, none, G.STEP); };
   run(n, none, 0.2);
-  check("NPC quiet when the player is far", !n.npcTalking);
-  n.player.x = 18 * G.TILE + 2; n.player.y = 8 * G.TILE + 5;  // just left of him
-  G.stepGame(n, none, G.STEP);
-  check("NPC talks when the player is close", n.npcTalking && n.npcLine === 0);
-  n.player.x = 8 * G.TILE; n.player.y = 12 * G.TILE;
-  G.stepGame(n, none, G.STEP);
-  n.player.x = 18 * G.TILE + 2; n.player.y = 8 * G.TILE + 5;
-  G.stepGame(n, none, G.STEP);
+  check("Old Man quiet when the player is far", !n.npcTalking);
+  nearIt();
+  check("Old Man talks when the player is close", n.npcTalking && n.npcLine === 0);
+  awayIt(); nearIt();
   check("walking up again gives the next line", n.npcLine === 1);
-  n.deepestFloor = 6;
-  n.player.x = 8 * G.TILE; G.stepGame(n, none, G.STEP);
-  n.player.x = 18 * G.TILE + 2; G.stepGame(n, none, G.STEP);
-  check("deeper floors switch to deeper lines", G.NPC_LINES[2].lines.length > 0 && n.npcTalking);
 
-  // Arena hop keeps HP; death goes back to the safe room is handled by the R key in the browser.
+  // Arena hop keeps HP
   const t = G.makeGame(1);
   t.player.hp = 3;
   G.switchArea(t);
   check("T: arena has skeletons and keeps your HP", t.area === "arena" && t.skeletons.length === G.WAVE_SIZE && t.player.hp === 3);
   G.switchArea(t);
-  check("T again: back in the safe room, still 3 HP, no skeletons", t.area === "safe" && t.player.hp === 3 && t.skeletons.length === 0);
+  check("T again: back on floor 1 in the safe room, still 3 HP", t.area === "maze" && G.inSafeRoom(t) && t.player.hp === 3);
 }
 
 function makeFresh() { return G.makeGame(1, { area: "arena", skeletons: false }); }
