@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Project Minos</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas {
+    display: block;
+    background: #000;
+    image-rendering: pixelated;
+    max-width: 100vw;
+    max-height: 100vh;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="640"></canvas>
+<script>
+"use strict";
+
+// ============================================================
+// Config
+// ============================================================
+const TILE = 32;            // pixels per tile
+const ROOM_W = 30;          // room width in tiles  (30 * 32 = 960)
+const ROOM_H = 20;          // room height in tiles (20 * 32 = 640)
+const STEP = 1 / 60;        // fixed simulation step, seconds
+
+const PLAYER_SIZE = 22;     // player hitbox, pixels (square)
+const PLAYER_SPEED = 180;   // pixels per second
+
+// Tile types
+const FLOOR = 0;
+const WALL = 1;
+
+// ============================================================
+// Room
+// ============================================================
+// A room is a grid of tiles. For now: floor everywhere, walls on the border.
+function makeRoom(w, h) {
+  const tiles = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const edge = x === 0 || y === 0 || x === w - 1 || y === h - 1;
+      tiles[y * w + x] = edge ? WALL : FLOOR;
+    }
+  }
+  return { w, h, tiles };
+}
+
+function tileAt(room, tx, ty) {
+  if (tx < 0 || ty < 0 || tx >= room.w || ty >= room.h) return WALL;
+  return room.tiles[ty * room.w + tx];
+}
+
+function isSolid(room, tx, ty) {
+  return tileAt(room, tx, ty) === WALL;
+}
+
+// ============================================================
+// Player
+// ============================================================
+function makePlayer(room) {
+  // Start in the middle of the room. x, y = top-left of the hitbox.
+  return {
+    x: (room.w * TILE) / 2 - PLAYER_SIZE / 2,
+    y: (room.h * TILE) / 2 - PLAYER_SIZE / 2,
+    size: PLAYER_SIZE,
+    facing: { x: 0, y: 1 }, // last direction moved; used later for sword swings
+  };
+}
+
+// Does a box at (x, y) of the given size overlap any solid tile?
+function boxHitsWall(room, x, y, size) {
+  const x0 = Math.floor(x / TILE);
+  const y0 = Math.floor(y / TILE);
+  const x1 = Math.floor((x + size - 1e-6) / TILE);
+  const y1 = Math.floor((y + size - 1e-6) / TILE);
+  for (let ty = y0; ty <= y1; ty++) {
+    for (let tx = x0; tx <= x1; tx++) {
+      if (isSolid(room, tx, ty)) return true;
+    }
+  }
+  return false;
+}
+
+// Move one axis at a time so the player slides along walls instead of sticking.
+// If a move would enter a wall, snap flush against it.
+function moveAxis(room, ent, dx, dy) {
+  if (dx !== 0) {
+    const nx = ent.x + dx;
+    if (!boxHitsWall(room, nx, ent.y, ent.size)) {
+      ent.x = nx;
+    } else if (dx > 0) {
+      ent.x = Math.floor((nx + ent.size) / TILE) * TILE - ent.size;
+    } else {
+      ent.x = (Math.floor(nx / TILE) + 1) * TILE;
+    }
+  }
+  if (dy !== 0) {
+    const ny = ent.y + dy;
+    if (!boxHitsWall(room, ent.x, ny, ent.size)) {
+      ent.y = ny;
+    } else if (dy > 0) {
+      ent.y = Math.floor((ny + ent.size) / TILE) * TILE - ent.size;
+    } else {
+      ent.y = (Math.floor(ny / TILE) + 1) * TILE;
+    }
+  }
+}
+
+// input = { up, down, left, right } booleans
+function updatePlayer(room, player, input, dt) {
+  let ix = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+  let iy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+  if (ix === 0 && iy === 0) return;
+
+  // Diagonals move at the same speed as straight lines.
+  const len = Math.hypot(ix, iy);
+  ix /= len;
+  iy /= len;
+  player.facing = { x: ix, y: iy };
+
+  const dist = PLAYER_SPEED * dt;
+  moveAxis(room, player, ix * dist, 0);
+  moveAxis(room, player, 0, iy * dist);
+}
+
+// ============================================================
+// Game state
+// ============================================================
+function makeGame() {
+  const room = makeRoom(ROOM_W, ROOM_H);
+  return { room, player: makePlayer(room) };
+}
+
+function stepGame(game, input, dt) {
+  updatePlayer(game.room, game.player, input, dt);
+}
+
+// ============================================================
+// Drawing
+// ============================================================
+function drawRoom(ctx, room) {
+  for (let ty = 0; ty < room.h; ty++) {
+    for (let tx = 0; tx < room.w; tx++) {
+      const t = tileAt(room, tx, ty);
+      const px = tx * TILE, py = ty * TILE;
+      if (t === WALL) {
+        ctx.fillStyle = "#4a4a58";
+        ctx.fillRect(px, py, TILE, TILE);
+        ctx.fillStyle = "#3a3a46";
+        ctx.fillRect(px, py + TILE - 6, TILE, 6);
+      } else {
+        // Subtle checker so movement is easy to see.
+        ctx.fillStyle = (tx + ty) % 2 === 0 ? "#26221e" : "#2b2621";
+        ctx.fillRect(px, py, TILE, TILE);
+      }
+    }
+  }
+}
+
+function drawPlayer(ctx, p) {
+  const cx = p.x + p.size / 2;
+  const cy = p.y + p.size / 2;
+  ctx.fillStyle = "#d9b45a";
+  ctx.fillRect(p.x, p.y, p.size, p.size);
+  ctx.strokeStyle = "#7a5c1e";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(p.x + 1, p.y + 1, p.size - 2, p.size - 2);
+  // Facing marker
+  ctx.fillStyle = "#fff4d0";
+  ctx.beginPath();
+  ctx.arc(cx + p.facing.x * 7, cy + p.facing.y * 7, 3, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function draw(ctx, game) {
+  drawRoom(ctx, game.room);
+  drawPlayer(ctx, game.player);
+}
+
+// ============================================================
+// Browser loop (skipped when loaded headless for tests)
+// ============================================================
+if (typeof window !== "undefined" && typeof document !== "undefined" && document.getElementById) {
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const game = makeGame();
+  const input = { up: false, down: false, left: false, right: false };
+
+  const KEYMAP = {
+    KeyW: "up", ArrowUp: "up",
+    KeyS: "down", ArrowDown: "down",
+    KeyA: "left", ArrowLeft: "left",
+    KeyD: "right", ArrowRight: "right",
+  };
+  window.addEventListener("keydown", (e) => {
+    const k = KEYMAP[e.code];
+    if (k) { input[k] = true; e.preventDefault(); }
+  });
+  window.addEventListener("keyup", (e) => {
+    const k = KEYMAP[e.code];
+    if (k) { input[k] = false; e.preventDefault(); }
+  });
+  // Don't keep walking if the window loses focus mid-keypress.
+  window.addEventListener("blur", () => {
+    input.up = input.down = input.left = input.right = false;
+  });
+
+  let last = performance.now();
+  let acc = 0;
+  function frame(now) {
+    acc += Math.min(0.25, (now - last) / 1000);
+    last = now;
+    while (acc >= STEP) {
+      stepGame(game, input, STEP);
+      acc -= STEP;
+    }
+    draw(ctx, game);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
