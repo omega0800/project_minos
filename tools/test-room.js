@@ -16,7 +16,7 @@ function loadGame() {
   vm.runInContext(
     m[1] + "\n;this.__api = { TILE, ROOM_W, ROOM_H, STEP, PLAYER_SPEED, WALL, FLOOR, makeGame, stepGame, tileAt, boxHitsWall," +
       " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER, FACING_LOCK_EXTRA, CHAIN_GRACE," +
-      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED, makeFirstFloor, switchArea, HEAL, DOOR, NPC, VOID, HEAL_INTERVAL, NPC_TALK_RANGE, NPC_LINES, cameraFor, inSafeRoom, VIEW_W, VIEW_H, CELL, isWalkable, CELL_EMPTY, CELL_BUILT, CELL_RESERVED, EDGE_OPEN, EDGE_UNDECIDED, DIRS, neighbour, getEdge, cellCentre, TORCH_RADIUS, GEN_RADIUS };",
+      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED, makeFirstFloor, switchArea, HEAL, DOOR, NPC, VOID, HEAL_INTERVAL, NPC_TALK_RANGE, NPC_LINES, cameraFor, inSafeRoom, VIEW_W, VIEW_H, CELL, isWalkable, CELL_EMPTY, CELL_BUILT, CELL_RESERVED, EDGE_OPEN, EDGE_UNDECIDED, DIRS, neighbour, getEdge, cellCentre, TORCH_RADIUS, GEN_RADIUS, respawnAtCheckpoint, floorDifficulty, inSafeArea, FLOORS_TO_HARD, SKEL_GIVE_UP, setTile, WALL };",
     ctx
   );
   return ctx.__api;
@@ -382,10 +382,11 @@ console.log("Floor 1 and the safe room");
   const place = (tx, ty) => { g.player.x = tx * T + 5; g.player.y = ty * T + 5; };
   check("game starts on floor 1, inside the safe room", g.area === "maze" && g.floorNum === 1 && G.inSafeRoom(g));
   check("floor is much bigger than the screen", r.w * T > G.VIEW_W * 2 && r.h * T > G.VIEW_H * 2);
-  check("no skeletons on floor 1 yet", g.skeletons.length === 0);
+  check("no skeletons in sight at the start", g.skeletons.every((sk) => !sk.aggro));
   check("player starts on open floor", !G.boxHitsWall(r, g.player.x, g.player.y, g.player.size));
+  const n0 = g.skeletons.length;
   run(g, none, G.WAVE_DELAY * 3);
-  check("no waves spawn in the maze", g.skeletons.length === 0);
+  check("no arena waves spawn in the maze", g.skeletons.length === n0);
 
   // Every walkable tile is enclosed: no walkable tile touches VOID.
   let leaks = 0;
@@ -465,6 +466,11 @@ console.log("Floor 1 and the safe room");
   check("T: arena has skeletons and keeps your HP", t.area === "arena" && t.skeletons.length === G.WAVE_SIZE && t.player.hp === 3);
   G.switchArea(t);
   check("T again: back on floor 1 in the safe room, still 3 HP", t.area === "maze" && G.inSafeRoom(t) && t.player.hp === 3);
+  const t2 = G.makeGame(4);
+  run(t2, hold({ down: true }), 3);
+  const floor = t2.room, built = floor.builtCount;
+  G.switchArea(t2); G.switchArea(t2);
+  check("T and back keeps the same floor (not a new one)", t2.room === floor && t2.room.builtCount >= built);
 }
 
 console.log("Maze generation");
@@ -499,7 +505,7 @@ console.log("Maze generation");
     }
     if (empty !== 0) allFull = false;
     // Loops = open walls beyond the one way into each cell (safe room counted as one node).
-    const loops = openEdges - r.builtCount;
+    const loops = r.loopCount;   // (open walls inside rooms and wide halls aren't loops)
     loopsTotal += loops; loopsMax = Math.max(loopsMax, loops); cellsTotal += r.builtCount;
     // Wide halls: 2 cells wide, 3-5 long, fully open inside (no pillars).
     for (const hall of r.wideHalls) {
@@ -558,11 +564,200 @@ console.log("Maze generation");
   check("generation reaches past the torchlight", G.GEN_RADIUS > G.TORCH_RADIUS + G.CELL * G.TILE);
 }
 
+console.log("Rooms");
+{
+  function exploreAll(seed, opts) {
+    const g = G.makeGame(seed, opts);
+    const r = g.room;
+    for (let guard = 0; guard < 5000 && r.frontier.length; guard++) {
+      const f = r.frontier[0].from;
+      const c = G.cellCentre(f.cx, f.cy);
+      g.player.x = c.x - 11; g.player.y = c.y - 11;
+      G.stepGame(g, none, G.STEP);
+      g.player.hp = G.PLAYER_MAX_HP; g.player.iframes = 1; // the hopper isn't here to fight
+    }
+    return g;
+  }
+  let rooms = 0, shapesOk = true, openOk = true, spawnsOk = true, countsOk = true, skels = 0, sizes = {};
+  for (const seed of [1, 2, 3, 4, 5, 6]) {
+    const g = exploreAll(seed), r = g.room;
+    for (const rm of r.rooms) {
+      rooms++;
+      const key = rm.w + "x" + rm.h; sizes[key] = (sizes[key] || 0) + 1;
+      if (![4, 6, 9].includes(rm.w * rm.h) || rm.cells.length !== rm.w * rm.h) shapesOk = false;
+      for (let y = rm.rect.y0; y <= rm.rect.y1; y++) for (let x = rm.rect.x0; x <= rm.rect.x1; x++)
+        if (!G.isWalkable(G.tileAt(r, x, y))) openOk = false;
+      const a = rm.w * rm.h, n = rm.spawns.length;
+      if ((a === 4 && (n < 1 || n > 2)) || (a === 6 && (n < 2 || n > 3)) || (a === 9 && (n < 2 || n > 4))) countsOk = false;
+      for (const sp of rm.spawns) {
+        skels++;
+        if (G.boxHitsWall(r, sp.x, sp.y, 22)) spawnsOk = false;
+        const cx = sp.x + 11, cy = sp.y + 11;
+        if (cx < rm.rect.x0 * G.TILE || cx > (rm.rect.x1 + 1) * G.TILE || cy < rm.rect.y0 * G.TILE || cy > (rm.rect.y1 + 1) * G.TILE) spawnsOk = false;
+      }
+    }
+  }
+  console.log("        (" + rooms + " rooms over 6 floors: " + JSON.stringify(sizes) + "; " + skels + " skeletons)");
+  check("rooms appear (several per floor)", rooms / 6 >= 5);
+  check("rooms are 2x2, 2x3, 3x2 or 3x3 cells", shapesOk);
+  check("rooms are fully open inside", openOk);
+  check("skeleton counts fit the room size (1-2 / 2-3 / 2-4)", countsOk);
+  check("skeletons spawn inside their room, not in walls", spawnsOk);
+
+  const empty = exploreAll(1, { enemies: false });
+  check("enemies off: rooms still appear but stay empty", empty.room.rooms.length > 0 && empty.skeletons.length === 0);
+
+  // Floor difficulty
+  const rng = G.makeRng(5);
+  let f1max = 0, f20sum = 0;
+  for (let i = 0; i < 200; i++) { f1max = Math.max(f1max, G.floorDifficulty(1, rng)); f20sum += G.floorDifficulty(G.FLOORS_TO_HARD, rng); }
+  check("floor 1 skeletons are near max easy (difficulty <= 0.1)", f1max <= 0.1 + 1e-9);
+  check("by floor " + G.FLOORS_TO_HARD + " skeletons average near max hard", f20sum / 200 > 0.9);
+  check("difficulty never drops going deeper", [1, 3, 6, 10, 15, 20, 30].every((f, i, a) => i === 0 ||
+    G.floorDifficulty(f, () => 0.5) >= G.floorDifficulty(a[i - 1], () => 0.5)));
+}
+
+console.log("Skeletons in the maze");
+{
+  // Arena scenarios with walls built in, so positions are exact.
+  function arenaWith(walls) {
+    const g = G.makeGame(1, { area: "arena", skeletons: false });
+    for (const [x, y] of walls) G.setTile(g.room, x, y, G.WALL);
+    return g;
+  }
+  // A wall column at x = 15 from y = 2 to 17.
+  const col = []; for (let y = 2; y <= 17; y++) col.push([15, y]);
+  const a = arenaWith(col);
+  a.player.x = 17 * G.TILE; a.player.y = 10 * G.TILE;
+  const sk = G.makeSkeleton(50, 12 * G.TILE, 10 * G.TILE, a.rng, 0);
+  a.skeletons.push(sk);
+  run(a, none, 2);
+  check("doesn't notice you through a wall", !sk.aggro);
+
+  // Same wall; it sees you first, then you step behind the wall: it goes around.
+  const b = arenaWith(col);
+  b.player.x = 12 * G.TILE; b.player.y = 1 * G.TILE + 5;      // above the wall's end, in view
+  const sk2 = G.makeSkeleton(51, 12 * G.TILE, 6 * G.TILE, b.rng, 0);
+  b.skeletons.push(sk2);
+  G.stepGame(b, none, G.STEP);
+  const noticed = sk2.aggro;
+  b.player.x = 17 * G.TILE; b.player.y = 6 * G.TILE;          // now hidden behind the wall
+  let reached = false;
+  for (let i = 0; i < Math.round(8 / G.STEP) && !reached; i++) {
+    G.stepGame(b, none, G.STEP);
+    if (b.player.hp < G.PLAYER_MAX_HP) reached = true;
+  }
+  check("chases you around a wall (path-finding) and attacks", noticed && reached, "noticed=" + noticed + " reached=" + reached);
+
+  // Gives up after losing you for a while.
+  const c = arenaWith(col);
+  c.player.x = 12 * G.TILE; c.player.y = 1 * G.TILE + 5;
+  const sk3 = G.makeSkeleton(52, 12 * G.TILE, 6 * G.TILE, c.rng, 0);
+  c.skeletons.push(sk3);
+  G.stepGame(c, none, G.STEP);
+  c.player.x = 27 * G.TILE; c.player.y = 17 * G.TILE;
+  // Box the player in so it can't be reached.
+  for (let y = 15; y <= 18; y++) G.setTile(c.room, 25, y, G.WALL);
+  for (let x = 25; x <= 28; x++) G.setTile(c.room, x, 15, G.WALL);
+  run(c, none, G.SKEL_GIVE_UP + 1);
+  check("gives up when it loses you for " + G.SKEL_GIVE_UP + " s", !sk3.aggro);
+
+  // Idle skeletons stay in their room.
+  // Explore until a room with skeletons is within their active range of the
+  // safe room (idle skeletons far from you don't move at all).
+  const g = G.makeGame(3);
+  const spawn = g.room.spawn;
+  const nearRoom = () => g.room.rooms.some((rm) => rm.spawns.length &&
+    Math.hypot((rm.rect.x0 + rm.rect.x1) / 2 * G.TILE - spawn.x, (rm.rect.y0 + rm.rect.y1) / 2 * G.TILE - spawn.y) < 18 * G.TILE);
+  for (let guard = 0; guard < 3000 && !nearRoom() && g.room.frontier.length; guard++) {
+    const f = g.room.frontier[0].from, cc = G.cellCentre(f.cx, f.cy);
+    g.player.x = cc.x - 11; g.player.y = cc.y - 11; G.stepGame(g, none, G.STEP);
+  }
+  G.respawnAtCheckpoint(g);   // fresh skeletons at their spawn points; player in the safe room
+  let wandered = false, inRoom = true;
+  const starts = g.skeletons.map((s2) => [s2.x, s2.y]);
+  for (let i = 0; i < Math.round(20 / G.STEP); i++) {
+    G.stepGame(g, none, G.STEP);
+  }
+  // (only skeletons within active range of the player move; check those that did)
+  g.skeletons.forEach((s2, i) => {
+    if (s2.x !== starts[i][0] || s2.y !== starts[i][1]) wandered = true;
+    const h = s2.home, cx2 = s2.x + 11, cy2 = s2.y + 11;
+    if (h && (cx2 < h.x0 || cx2 > h.x1 || cy2 < h.y0 || cy2 > h.y1)) inRoom = false;
+  });
+  check("idle skeletons wander but stay in their rooms", inRoom && (wandered || g.skeletons.length === 0));
+
+  // A fighting bot explores with skeletons around: nobody ends up in walls,
+  // skeletons never get into the safe room, and dying brings you back.
+  let wallBad = false, safeBad = false, deaths = 0, kills = 0, respawnOk = true, simT = 0;
+  for (const seed of [1, 2, 3]) {
+    const f = G.makeGame(seed, { floorCells: 15 }), r = f.room, W = r.cellsW;
+    const leaveSafeRoom = () => { f.player.x = r.door.tx * G.TILE + 5; f.player.y = (r.door.ty + 2) * G.TILE; };
+    leaveSafeRoom();
+    const cellOf = () => ({ cx: Math.floor((f.player.x + 11) / 96), cy: Math.floor((f.player.y + 11) / 96) });
+    let path = null;
+    for (let i = 0; i < Math.round(240 / G.STEP); i++) {
+      simT += G.STEP;
+      const p = f.player, pc = { x: p.x + 11, y: p.y + 11 };
+      let inp = Object.assign({}, none);
+      // Fight anything chasing and close; otherwise explore.
+      const foe = f.skeletons.filter((s2) => s2.aggro).sort((s1, s2) => Math.hypot(s1.x - p.x, s1.y - p.y) - Math.hypot(s2.x - p.x, s2.y - p.y))[0];
+      if (foe && Math.hypot(foe.x - p.x, foe.y - p.y) < 48) {
+        const dx = foe.x - p.x, dy = foe.y - p.y, dd = Math.hypot(dx, dy) || 1;
+        p.facing = { x: dx / dd, y: dy / dd };
+        if (i % 12 === 0) inp.attack = true;
+      } else if (r.frontier.length) {
+        if (!path || !path.length) {
+          const targets = new Set(r.frontier.map((q) => q.from.cy * W + q.from.cx));
+          const st = cellOf(), prev = new Map([[st.cy * W + st.cx, null]]), qq = [st.cy * W + st.cx];
+          path = null;
+          while (qq.length) {
+            const k = qq.shift();
+            if (targets.has(k)) { path = []; let z = k; while (z !== null) { path.unshift(z); z = prev.get(z); } break; }
+            const cx = k % W, cy = (k / W) | 0;
+            for (const d of G.DIRS) {
+              const n = G.neighbour(r, cx, cy, d);
+              if (!n || G.getEdge(r, cx, cy, d) !== G.EDGE_OPEN) continue;
+              const j = n.cy * W + n.cx;
+              if (r.cells[j] === G.CELL_EMPTY || prev.has(j)) continue;
+              prev.set(j, k); qq.push(j);
+            }
+          }
+          if (!path) path = [];
+        }
+        if (path.length) {
+          const k = path[0], c2 = G.cellCentre(k % W, (k / W) | 0);
+          inp = { right: c2.x - pc.x > 2, left: c2.x - pc.x < -2, down: c2.y - pc.y > 2, up: c2.y - pc.y < -2 };
+          if (!inp.right && !inp.left && !inp.down && !inp.up) path.shift();
+        }
+      }
+      G.stepGame(f, inp, G.STEP);
+      for (const e of [f.player, ...f.skeletons]) if (G.boxHitsWall(r, e.x, e.y, e.size)) wallBad = true;
+      for (const s2 of f.skeletons) if (G.inSafeArea(r, s2.x + 11, s2.y + 11)) safeBad = true;
+      if (f.over) {
+        deaths++;
+        const builtBefore = r.builtCount, spawns = r.rooms.reduce((n, rm) => n + rm.spawns.length, 0);
+        G.respawnAtCheckpoint(f);
+        const ok = G.inSafeRoom(f);
+        leaveSafeRoom();
+        if (!ok || f.room !== r || f.room.builtCount !== builtBefore || f.player.hp !== G.PLAYER_MAX_HP ||
+            f.skeletons.length !== spawns) respawnOk = false;
+        path = null;
+      }
+    }
+    kills += f.kills;
+  }
+  console.log("        (fighting bot: " + simT.toFixed(0) + " s, " + kills + " kills, " + deaths + " deaths)");
+  check("fighting in the maze: nobody ever inside a wall", !wallBad);
+  check("skeletons never get into the safe room", !safeBad);
+  check("dying: back in the safe room, full HP, same floor, every room's skeletons back", respawnOk);
+}
+
 console.log("Walking the maze (never see it being built)");
 {
   // A bot that really walks: heads for the nearest frontier through open cells.
   // Small 15x15 floor so the test stays quick; full-size timing is a tuning job.
-  const g = G.makeGame(11, { floorCells: 15 }), r = g.room, W = r.cellsW, T = G.TILE;
+  const g = G.makeGame(11, { floorCells: 15, enemies: false }), r = g.room, W = r.cellsW, T = G.TILE;
   const typeAt = new Int8Array(r.w * r.h).fill(-1); // tile type when last seen
   let sawVoid = 0, popped = 0, steps = 0;
   const cellOf = () => { const c = { x: g.player.x + 11, y: g.player.y + 11 }; return { cx: Math.floor(c.x / (3 * T)), cy: Math.floor(c.y / (3 * T)) }; };

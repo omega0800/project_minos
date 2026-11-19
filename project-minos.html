@@ -41,6 +41,16 @@ const BRANCH_CHANCE = 0.4;  // chance each side of a new cell opens into untouch
 const LOOP_CHANCE = 0.06;   // chance a side opens into an already-reachable cell, making a loop (p)
 const WIDE_HALL_CHANCE = 0.025; // chance a new cell starts a wide hall instead
 const WIDE_HALL_MIN = 3, WIDE_HALL_MAX = 5; // wide hall length in cells (always 2 cells = 5 tiles wide)
+const ROOM_CHANCE = 0.05;   // chance a new cell becomes a room instead
+// Room shapes in cells [w, h] with weights. 2x2 = 5x5 tiles, 2x3 = 5x8, 3x3 = 8x8.
+const ROOM_SHAPES = [[2, 2, 5], [2, 3, 2], [3, 2, 2], [3, 3, 2]];
+
+// Skeletons in the maze
+const FLOORS_TO_HARD = 20;        // the average skeleton reaches max hard on this floor
+const DIFFICULTY_SPREAD = 0.1;    // each skeleton is up to this much easier/harder than its floor's average
+const SKEL_GIVE_UP = 4;           // a chasing skeleton gives up after losing sight of you this long, s
+const SKEL_ACTIVE_RANGE = 26 * TILE; // idle skeletons further away than this don't bother moving
+const FLOW_RADIUS = 30;           // how far (in tiles) skeletons can path-find toward you
 
 // Torchlight
 const TORCH_RADIUS = 6.5 * TILE;  // you can see this far (blocked by walls)
@@ -306,6 +316,7 @@ function initCells(room) {
   room.builtCount = 0;
   room.loopCount = 0;
   room.wideHalls = [];                                    // each is a list of [cx, cy]
+  room.rooms = [];                                        // { cells, cx0, cy0, w, h, rect, spawns }
   room.seen = new Uint8Array(room.w * room.h);            // tiles you've ever seen
   room.visible = new Uint8Array(room.w * room.h);         // tiles you can see right now
   room.visList = [];
@@ -460,14 +471,17 @@ function keepReachable(game, cx, cy, openable) {
 function buildCell(game, entry) {
   const room = game.room, rng = game.rng;
   room.frontier = room.frontier.filter((f) => f !== entry);
-  let block = null;
-  if (rng() < WIDE_HALL_CHANCE) block = planWideHall(game, entry);
+  let block = null, roomPlan = null;
+  const roll = rng();
+  if (roll < ROOM_CHANCE) { roomPlan = planRoom(game, entry); if (roomPlan) block = roomPlan.cells; }
+  else if (roll < ROOM_CHANCE + WIDE_HALL_CHANCE) block = planWideHall(game, entry);
   if (!block) block = [[entry.cx, entry.cy]];
 
   for (const [x, y] of block) markBuilt(room, x, y);
   if (block.length > 1) mergeBlock(room, block);
   for (const [x, y] of block) carveOpenEdges(room, x, y);
-  if (block.length > 1) room.wideHalls.push(block);
+  if (roomPlan) addRoom(game, roomPlan);
+  else if (block.length > 1) room.wideHalls.push(block);
 
   const openable = [];
   for (const [x, y] of block) {
@@ -504,6 +518,71 @@ function mergeBlock(room, block) {
     if (has(x + 1, y) && has(x, y + 1) && has(x + 1, y + 1))
       setTile(room, (x + 1) * CELL, (y + 1) * CELL, FLOOR);
   }
+}
+
+// A room: a block of 2x2, 2x3, 3x2 or 3x3 cells that includes the entry cell.
+// Every other cell it needs must be untouched. Returns { cells, cx0, cy0, w, h } or null.
+function planRoom(game, entry) {
+  const room = game.room, rng = game.rng, W = room.cellsW;
+  const free = (x, y) => (x === entry.cx && y === entry.cy) ||
+    (x >= 0 && y >= 0 && x < W && y < room.cellsH && cellState(room, x, y) === CELL_EMPTY && !room.claimed[y * W + x]);
+  // Pick a shape by weight, then fall back through the others.
+  const total = ROOM_SHAPES.reduce((a, s) => a + s[2], 0);
+  let r = rng() * total, first = 0;
+  for (let i = 0; i < ROOM_SHAPES.length; i++) { r -= ROOM_SHAPES[i][2]; if (r < 0) { first = i; break; } }
+  const order = [ROOM_SHAPES[first], ...shuffled(ROOM_SHAPES.filter((_, i) => i !== first), rng)];
+  for (const [w, h] of order) {
+    const offsets = [];
+    for (let oy = entry.cy - h + 1; oy <= entry.cy; oy++)
+      for (let ox = entry.cx - w + 1; ox <= entry.cx; ox++) offsets.push([ox, oy]);
+    for (const [ox, oy] of shuffled(offsets, rng)) {
+      const cells = [];
+      let ok = true;
+      for (let y = oy; y < oy + h && ok; y++)
+        for (let x = ox; x < ox + w && ok; x++) { if (!free(x, y)) ok = false; cells.push([x, y]); }
+      if (ok) return { cells, cx0: ox, cy0: oy, w, h };
+    }
+  }
+  return null;
+}
+
+// Record a new room and put its skeletons in it (out of sight).
+function addRoom(game, plan) {
+  const room = game.room, rng = game.rng;
+  const rect = {   // floor tiles, inclusive
+    x0: plan.cx0 * CELL + 1, y0: plan.cy0 * CELL + 1,
+    x1: (plan.cx0 + plan.w) * CELL - 1, y1: (plan.cy0 + plan.h) * CELL - 1,
+  };
+  const area = plan.w * plan.h;
+  const count = game.enemies === false ? 0
+    : area <= 4 ? 1 + Math.floor(rng() * 2)          // 2x2: 1-2
+    : area <= 6 ? 2 + Math.floor(rng() * 2)          // 2x3: 2-3
+    : 2 + Math.floor(rng() * 3);                     // 3x3: 2-4
+  const spawns = [];
+  for (let i = 0; i < count; i++) {
+    for (let tries = 0; tries < 30; tries++) {
+      const x = (rect.x0 + 0.5) * TILE + rng() * ((rect.x1 - rect.x0) * TILE - SKEL_SIZE);
+      const y = (rect.y0 + 0.5) * TILE + rng() * ((rect.y1 - rect.y0) * TILE - SKEL_SIZE);
+      if (spawns.some((s) => Math.hypot(s.x - x, s.y - y) < SKEL_SIZE * 1.5)) continue;
+      spawns.push({ x, y, difficulty: floorDifficulty(game.floorNum, rng) });
+      break;
+    }
+  }
+  const r = { ...plan, rect, spawns };
+  room.rooms.push(r);
+  for (const sp of spawns) game.skeletons.push(skeletonFromSpawn(game, sp, r));
+}
+
+// Average skeleton difficulty rises with depth; each skeleton varies a little.
+function floorDifficulty(floorNum, rng) {
+  const base = Math.min(1, Math.max(0, (floorNum - 1) / (FLOORS_TO_HARD - 1)));
+  return Math.min(1, Math.max(0, base + (rng() * 2 - 1) * DIFFICULTY_SPREAD));
+}
+
+function skeletonFromSpawn(game, sp, r) {
+  const sk = makeSkeleton(game.nextId++, sp.x, sp.y, game.rng, sp.difficulty);
+  sk.home = { x0: r.rect.x0 * TILE, y0: r.rect.y0 * TILE, x1: (r.rect.x1 + 1) * TILE, y1: (r.rect.y1 + 1) * TILE };
+  return sk;
 }
 
 // A wide hall: 2 cells wide and 3-5 long, running straight on from the way in.
@@ -867,7 +946,80 @@ function makeSkeleton(id, x, y, rng, difficulty) {
     stun: 0,
     wanderT: rng() * 1.5,        // time until next wander decision
     wanderDir: null,             // { x, y } or null (standing still)
+    home: null,                  // room it wanders in (pixels), if any
+    lostT: 0,                    // how long a chasing skeleton has not seen you
+    pathT: 0,                    // >0: path-find instead of walking straight
   };
+}
+
+// Is there a clear straight line between two points (nothing solid in between)?
+function losClear(room, ax, ay, bx, by) {
+  const n = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / (TILE / 4)));
+  for (let k = 1; k < n; k++) {
+    if (isSolid(room, Math.floor((ax + (bx - ax) * k / n) / TILE), Math.floor((ay + (by - ay) * k / n) / TILE))) return false;
+  }
+  return true;
+}
+
+// Is a point inside the safe room (including its doorway line)? Skeletons stay out.
+function inSafeArea(room, x, y) {
+  const r = room.safeRect;
+  if (!r) return false;
+  const tx = Math.floor(x / TILE), ty = Math.floor(y / TILE);
+  return tx >= r.x0 - 1 && tx <= r.x1 + 1 && ty >= r.y0 - 1 && ty <= r.y1 + 1;
+}
+
+// Move a skeleton, never into the safe room.
+function moveSkeleton(room, sk, dx, dy) {
+  const x0 = sk.x, y0 = sk.y;
+  moveAxis(room, sk, dx, 0);
+  if (inSafeArea(room, sk.x + sk.size / 2, sk.y + sk.size / 2)) sk.x = x0;
+  moveAxis(room, sk, 0, dy);
+  if (inSafeArea(room, sk.x + sk.size / 2, sk.y + sk.size / 2)) sk.y = y0;
+  return Math.hypot(sk.x - x0, sk.y - y0);
+}
+
+// Distance (in tile steps) from the player to every nearby walkable tile,
+// avoiding the safe room. Chasing skeletons walk downhill on it.
+function updateFlowField(game) {
+  const room = game.room;
+  if (!game.flow || game.flow.w !== room.w) game.flow = { w: room.w, dist: new Int16Array(room.w * room.h).fill(-1), list: [] };
+  const f = game.flow;
+  for (const i of f.list) f.dist[i] = -1;
+  f.list.length = 0;
+  const pc = centerOf(game.player);
+  const start = Math.floor(pc.y / TILE) * room.w + Math.floor(pc.x / TILE);
+  f.dist[start] = 0; f.list.push(start);
+  for (let h = 0; h < f.list.length; h++) {
+    const i = f.list[h], d = f.dist[i];
+    if (d >= FLOW_RADIUS) continue;
+    const x = i % room.w, y = (i / room.w) | 0;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + dx, ny = y + dy, j = ny * room.w + nx;
+      if (nx < 0 || ny < 0 || nx >= room.w || ny >= room.h || f.dist[j] !== -1) continue;
+      if (!isWalkable(tileAt(room, nx, ny)) || inSafeArea(room, (nx + 0.5) * TILE, (ny + 0.5) * TILE)) continue;
+      f.dist[j] = d + 1; f.list.push(j);
+    }
+  }
+}
+
+// Step toward the neighbouring tile that is closest to the player.
+function followFlow(game, sk, speed, dt) {
+  const room = game.room, f = game.flow;
+  const c = centerOf(sk);
+  const tx = Math.floor(c.x / TILE), ty = Math.floor(c.y / TILE);
+  const here = f ? f.dist[ty * room.w + tx] : -1;
+  let best = null, bestD = here >= 0 ? here : Infinity;
+  for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    const d = f ? f.dist[(ty + dy) * room.w + tx + dx] : -1;
+    if (d >= 0 && d < bestD) { bestD = d; best = [tx + dx, ty + dy]; }
+  }
+  if (!best) return 0;
+  // Aim for the next tile's centre (keeps the body clear of corners).
+  const gx = (best[0] + 0.5) * TILE, gy = (best[1] + 0.5) * TILE;
+  const ax = gx - c.x, ay = gy - c.y, len = Math.hypot(ax, ay) || 1;
+  sk.facing = { x: ax / len, y: ay / len };
+  return moveSkeleton(room, sk, (ax / len) * speed * dt, (ay / len) * speed * dt);
 }
 
 function updateSkeleton(game, sk, dt) {
@@ -879,8 +1031,15 @@ function updateSkeleton(game, sk, dt) {
 
   const d = distBetween(sk, p);
   const playerAlive = !game.over;
-  if (!sk.aggro && playerAlive && d <= st.aggroRange) sk.aggro = true;
-  if (sk.aggro && (!playerAlive || d > st.leashRange)) sk.aggro = false;
+  if (!sk.aggro && d > SKEL_ACTIVE_RANGE) return; // far away and idle: nothing to do
+  const sc = centerOf(sk), pc = centerOf(p);
+  const sees = d <= st.leashRange && losClear(room, sc.x, sc.y, pc.x, pc.y);
+  const playerSafe = room.safeRect ? inSafeArea(room, pc.x, pc.y) : false;
+  if (!sk.aggro && playerAlive && !playerSafe && d <= st.aggroRange && sees) { sk.aggro = true; sk.lostT = 0; }
+  if (sk.aggro) {
+    sk.lostT = sees ? 0 : sk.lostT + dt;
+    if (!playerAlive || playerSafe || d > st.leashRange || sk.lostT > SKEL_GIVE_UP) sk.aggro = false;
+  }
 
   // Swinging
   if (sk.swing) {
@@ -903,19 +1062,33 @@ function updateSkeleton(game, sk, dt) {
     return;
   }
 
-  const sc = centerOf(sk), pc = centerOf(p);
   if (sk.aggro) {
     const ax = pc.x - sc.x, ay = pc.y - sc.y;
     const len = Math.hypot(ax, ay) || 1;
-    sk.facing = { x: ax / len, y: ay / len };
-    if (d <= st.attackRange && sk.cooldown === 0) {
+    if (sk.pathT > 0) sk.pathT = Math.max(0, sk.pathT - dt);
+    if (sees && d <= st.attackRange && sk.cooldown === 0) {
+      sk.facing = { x: ax / len, y: ay / len };
       sk.windup = st.windup;
       sk.windupAngle = Math.atan2(ay, ax);
-    } else if (d > st.stopRange) {
-      moveAxis(room, sk, sk.facing.x * st.speed * dt, 0);
-      moveAxis(room, sk, 0, sk.facing.y * st.speed * dt);
+    } else if (sees && d <= st.stopRange) {
+      sk.facing = { x: ax / len, y: ay / len };
+    } else if (sees && sk.pathT === 0) {
+      // Walk straight at you; if a corner snags the body, path-find for a bit.
+      sk.facing = { x: ax / len, y: ay / len };
+      const moved = moveSkeleton(room, sk, sk.facing.x * st.speed * dt, sk.facing.y * st.speed * dt);
+      if (moved < st.speed * dt * 0.3) sk.pathT = 0.4;
+    } else {
+      followFlow(game, sk, st.speed, dt);
     }
   } else {
+    // Outside its room (pushed out, or after a chase)? Walk back home.
+    const h = sk.home, half = sk.size / 2;
+    if (h && !(sc.x >= h.x0 + half && sc.x <= h.x1 - half && sc.y >= h.y0 + half && sc.y <= h.y1 - half)) {
+      const hx = (h.x0 + h.x1) / 2 - sc.x, hy = (h.y0 + h.y1) / 2 - sc.y, hl = Math.hypot(hx, hy) || 1;
+      sk.facing = { x: hx / hl, y: hy / hl };
+      moveSkeleton(room, sk, sk.facing.x * st.wanderSpeed * dt, sk.facing.y * st.wanderSpeed * dt);
+      return;
+    }
     // Wander: alternate between short strolls and standing around.
     sk.wanderT -= dt;
     if (sk.wanderT <= 0) {
@@ -929,8 +1102,15 @@ function updateSkeleton(game, sk, dt) {
       sk.wanderT = 0.8 + rng() * 1.6;
     }
     if (sk.wanderDir) {
-      moveAxis(room, sk, sk.wanderDir.x * st.wanderSpeed * dt, 0);
-      moveAxis(room, sk, 0, sk.wanderDir.y * st.wanderSpeed * dt);
+      // Stay in its room: turn back rather than wander out of it.
+      const nx = sc.x + sk.wanderDir.x * st.wanderSpeed * dt, ny = sc.y + sk.wanderDir.y * st.wanderSpeed * dt;
+      const insideNow = !h || (sc.x >= h.x0 + half && sc.x <= h.x1 - half && sc.y >= h.y0 + half && sc.y <= h.y1 - half);
+      const insideNext = !h || (nx >= h.x0 + half && nx <= h.x1 - half && ny >= h.y0 + half && ny <= h.y1 - half);
+      if (insideNow && !insideNext) {
+        sk.wanderDir = { x: -sk.wanderDir.x, y: -sk.wanderDir.y };
+        sk.facing = sk.wanderDir;
+      }
+      moveSkeleton(room, sk, sk.wanderDir.x * st.wanderSpeed * dt, sk.wanderDir.y * st.wanderSpeed * dt);
     }
   }
 }
@@ -948,8 +1128,8 @@ function separateSkeletons(game, dt) {
       if (d >= min) continue;
       if (d < 1e-6) { dx = 1; dy = 0; d = 1; }
       const push = Math.min((min - d) / 2, 120 * dt);
-      moveAxis(game.room, a, (-dx / d) * push, (-dy / d) * push);
-      moveAxis(game.room, b, (dx / d) * push, (dy / d) * push);
+      moveSkeleton(game.room, a, (-dx / d) * push, (-dy / d) * push);
+      moveSkeleton(game.room, b, (dx / d) * push, (dy / d) * push);
     }
   }
 }
@@ -1022,6 +1202,9 @@ function makeGame(seed, opts) {
   const room = area === "maze" ? makeFirstFloor(floorCells) : makeRoom(ROOM_W, ROOM_H);
   const game = {
     floorCells,
+    enemies: !(opts && opts.enemies === false), // opts.enemies === false: rooms stay empty (tests)
+    flow: null,
+    flowT: 0,
     area,
     room,
     player: makePlayer(room),
@@ -1041,23 +1224,43 @@ function makeGame(seed, opts) {
     difficulty: (opts && opts.difficulty) || 0, // skeleton difficulty for new waves (testing keys 1-5)
   };
   if (game.waves && area === "arena") spawnWave(game, WAVE_SIZE);
+  game.mazeRoom = area === "maze" ? room : null;
   if (area === "maze") { growMaze(game); computeVisibility(game); }
   return game;
 }
 
-// Testing: hop between the maze and the arena (key T). Keeps your HP.
+// Back to the checkpoint (the safe room) after dying: full health, the floor
+// stays exactly as explored, and every room's skeletons are back.
+function respawnAtCheckpoint(game) {
+  if (!game.mazeRoom) game.mazeRoom = makeFirstFloor(game.floorCells);
+  game.area = "maze";
+  game.room = game.mazeRoom;
+  game.player = makePlayer(game.room);
+  game.over = false;
+  game.effects = [];
+  game.npcTalking = false;
+  game.skeletons = [];
+  for (const r of game.room.rooms) for (const sp of r.spawns) game.skeletons.push(skeletonFromSpawn(game, sp, r));
+  growMaze(game);
+  computeVisibility(game);
+}
+
+// Testing: hop between the maze and the arena (key T). Keeps your HP. Coming
+// back puts you in the safe room on the same floor, skeletons respawned.
 function switchArea(game) {
   const hp = game.player.hp;
-  game.area = game.area === "maze" ? "arena" : "maze";
-  game.room = game.area === "maze" ? makeFirstFloor(game.floorCells) : makeRoom(ROOM_W, ROOM_H);
-  game.player = makePlayer(game.room);
+  if (game.area === "maze") {
+    game.area = "arena";
+    game.room = makeRoom(ROOM_W, ROOM_H);
+    game.player = makePlayer(game.room);
+    game.skeletons = [];
+    game.effects = [];
+    game.waveTimer = 0;
+    if (game.waves) spawnWave(game, WAVE_SIZE);
+  } else {
+    respawnAtCheckpoint(game);
+  }
   game.player.hp = hp;
-  game.skeletons = [];
-  game.effects = [];
-  game.waveTimer = 0;
-  game.npcTalking = false;
-  if (game.area === "arena" && game.waves) spawnWave(game, WAVE_SIZE);
-  if (game.area === "maze") { growMaze(game); computeVisibility(game); }
 }
 
 // ---------- Safe room behaviour ----------
@@ -1118,6 +1321,9 @@ function stepGame(game, input, dt) {
     growMaze(game);
     computeVisibility(game);
   }
+  // Refresh the chase map a few times a second while anything is chasing you.
+  game.flowT -= dt;
+  if (game.flowT <= 0 && game.skeletons.some((sk) => sk.aggro)) { updateFlowField(game); game.flowT = 0.2; }
   playerAttacks(game);
   for (const sk of game.skeletons) updateSkeleton(game, sk, dt);
   separateSkeletons(game, dt);
@@ -1218,6 +1424,14 @@ function drawLighting(ctx, game, cam) {
       ctx.fillStyle = a >= 1 ? "#0b0a0c" : `rgba(11, 10, 12, ${a})`;
       ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
     }
+}
+
+// Only draw what's in your torchlight.
+function canSee(game, ent) {
+  const room = game.room;
+  if (!room.visible) return true;
+  const c = centerOf(ent);
+  return !!room.visible[Math.floor(c.y / TILE) * room.w + Math.floor(c.x / TILE)];
 }
 
 function drawNpc(ctx, room) {
@@ -1403,7 +1617,7 @@ function drawHud(ctx, game) {
   ctx.font = "12px monospace";
   const hint = game.area === "arena"
     ? "Test arena  |  Skeleton difficulty " + game.difficulty.toFixed(2) + " (keys 1-5)  |  T: back to the maze"
-    : "T: test arena (until the maze has enemies)";
+    : "T: skeleton test arena";
   ctx.fillText(hint, VIEW_W / 2, VIEW_H - 10);
 
   if (game.over) {
@@ -1427,9 +1641,10 @@ function draw(ctx, game, time) {
   drawRoom(ctx, game.room, cam);
   drawHealGlow(ctx, game.room, time || 0);
   drawNpc(ctx, game.room);
-  for (const sk of game.skeletons) drawSkeleton(ctx, sk);
+  const shown = game.skeletons.filter((sk) => canSee(game, sk));
+  for (const sk of shown) drawSkeleton(ctx, sk);
   drawPlayer(ctx, game.player, game.over);
-  for (const sk of game.skeletons) drawSwing(ctx, sk, "rgba(255, 110, 80, 0.20)", "#f0c8b8");
+  for (const sk of shown) drawSwing(ctx, sk, "rgba(255, 110, 80, 0.20)", "#f0c8b8");
   drawSwing(ctx, game.player, "rgba(230, 235, 255, 0.18)", "#e8ecf8");
   drawEffects(ctx, game);
   drawLighting(ctx, game, cam);
@@ -1447,6 +1662,7 @@ if (typeof window !== "undefined" && typeof document !== "undefined" && document
   let game = makeGame((Math.random() * 1e9) | 0);
   const input = { up: false, down: false, left: false, right: false, attack: false };
   let attackPressed = false; // set by keydown, consumed by the next simulation step
+  window.__minos = { game: () => game, cellCentre, stepGame, STEP }; // debugging / screenshot scripts
 
   const KEYMAP = {
     KeyW: "up", ArrowUp: "up",
@@ -1461,8 +1677,8 @@ if (typeof window !== "undefined" && typeof document !== "undefined" && document
       return;
     }
     if (e.code === "KeyR" && game.over) {
-      // Back to the checkpoint: the safe room, full health.
-      game = makeGame((Math.random() * 1e9) | 0, { difficulty: game.difficulty });
+      // Back to the checkpoint: the safe room, full health, same floor.
+      respawnAtCheckpoint(game);
       return;
     }
     if (e.code === "KeyT" && !game.over) {
