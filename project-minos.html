@@ -76,7 +76,8 @@ const SKELETON_HARD = Object.assign({}, SKELETON_EASY, {
   aggroRange: 320,
   leashRange: 550,
   attackRange: 49,        // matches its longer reach
-  windup: 0.08,           // barely any warning
+  windup: 0.12,           // very little warning
+  cooldown: 0.595,        // 15% shorter pause between swings than easy (0.7)
   swingArc: Math.PI * 3 / 4, // 135 degrees
   swingReach: 43,
 });
