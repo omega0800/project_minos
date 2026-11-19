@@ -36,7 +36,8 @@ const ROOM_H = 20;
 const CELL = 3;
 const FLOOR_CELLS = 31;     // default floor size in cells when a fixed size is asked for (tests)
 const FLOOR_MIN_CELLS = 19, FLOOR_MAX_CELLS = 25; // each floor is a random odd size in this range (for now)
-const SAFE_EVERY = 3;       // floors 1, 4, 7, ... have a safe room (3 while testing)
+const SAFE_EVERY = 3;       // floors 0, 3, 6, ... have a safe room (3 while testing)
+const FLOOR0_CELLS = 13;    // floor 0: the safe room and a short hallway to the stairs down
 const EXIT_K = 6;           // exit chance curve: X = (e^(k f) - 1) / (e^k - 1), f = fraction of floor built
 
 // Maze generation
@@ -259,8 +260,32 @@ function wallUp(room) {
 // the maze can grow from there.
 function makeFirstFloor(cells) { return makeSafeFloor(cells, false); }
 
-// A floor with the safe room at its centre (floor 1, and every SAFE_EVERY
-// floors after). Below floor 1 the safe room also has the stairs back up.
+// Floor 0, where every game starts: the safe room and one short hand-built
+// hallway from its doorway to the stairs down. Nothing is generated here.
+function makeFloorZero() {
+  const room = makeSafeFloor(FLOOR0_CELLS, false);
+  const c = Math.floor(FLOOR0_CELLS / 2);
+  // The safe floor put the cell below the doorway on the frontier; build the
+  // hallway by hand instead: down 2 cells, then right 2, stairs at the end.
+  room.frontier = [];
+  room.claimed.fill(0);
+  const path = [[c, c + 3], [c, c + 4], [c + 1, c + 4], [c + 2, c + 4]];
+  for (const [x, y] of path) { room.cells[y * room.cellsW + x] = CELL_BUILT; carveCell(room, x, y); }
+  openEdge(room, c, c + 2, "s");
+  openEdge(room, c, c + 3, "s");
+  openEdge(room, c, c + 4, "e");
+  openEdge(room, c + 1, c + 4, "e");
+  // Stairs fill the far end of the hallway, so walking along it leads onto them.
+  const tx = (c + 2) * CELL + 2, ty = (c + 4) * CELL + 1;
+  setTile(room, tx, ty, STAIRS_DOWN); setTile(room, tx, ty + 1, STAIRS_DOWN);
+  room.exit = { tiles: [[tx, ty], [tx, ty + 1]], spawn: { x: (tx + 0.5) * TILE, y: (ty + 1) * TILE } };
+  room.buildable = 0;           // no generation, no exit roll
+  wallUp(room);
+  return room;
+}
+
+// A floor with the safe room at its centre (floor 0, and every SAFE_EVERY
+// floors after). Below floor 0 the safe room also has the stairs back up.
 function makeSafeFloor(cells, withUpStairs) {
   const n = cells || FLOOR_CELLS;                        // odd, at least 9
   const room = makeFloorGrid(n, n);
@@ -1267,13 +1292,13 @@ function playerAttacks(game) {
 function makeGame(seed, opts) {
   const area = (opts && opts.area) || "maze";
   const fixedCells = (opts && opts.floorCells) || null; // opts.floorCells: every floor this size (tests)
+  const startFloor = (opts && opts.startFloor) || 0;     // opts.startFloor: begin deeper (tests)
   const rng = makeRng(seed === undefined ? 1 : seed);
-  const firstCells = fixedCells || randomFloorCells(rng);
-  const room = area === "maze" ? makeFirstFloor(firstCells) : makeRoom(ROOM_W, ROOM_H);
+  const room = makeRoom(ROOM_W, ROOM_H);                 // the arena (replaced below in the maze)
   const game = {
     floorCells: fixedCells,
     floors: new Map(),     // floor number -> floor (every floor visited stays as explored)
-    checkpointFloor: 1,    // the most recent safe-room floor reached
+    checkpointFloor: 0,    // the most recent safe-room floor reached
     stairsLock: false,     // true while standing on the stairs you just arrived on
     enemies: !(opts && opts.enemies === false), // opts.enemies === false: rooms stay empty (tests)
     flow: null,
@@ -1281,8 +1306,8 @@ function makeGame(seed, opts) {
     area,
     room,
     player: makePlayer(room),
-    floorNum: 1,           // current maze floor
-    deepestFloor: 1,       // deepest maze floor reached (picks the Old Man's lines)
+    floorNum: 0,           // current maze floor (0 = the starting safe room)
+    deepestFloor: 0,       // deepest maze floor reached (picks the Old Man's lines)
     npcTalking: false,     // player is near the NPC right now
     npcLine: -1,           // index into the current line group
     healTimer: 0,
@@ -1297,9 +1322,11 @@ function makeGame(seed, opts) {
     difficulty: (opts && opts.difficulty) || 0, // skeleton difficulty for new waves (testing keys 1-5)
   };
   if (game.waves && area === "arena") spawnWave(game, WAVE_SIZE);
-  game.floors.set(1, room);
-  game.mazeRoom = area === "maze" ? room : null;
-  if (area === "maze") { growMaze(game); computeVisibility(game); }
+  game.mazeRoom = null;
+  if (area === "maze") {
+    game.player = null;
+    enterFloor(game, startFloor, isSafeFloorNum(startFloor) ? "checkpoint" : "down");
+  }
   return game;
 }
 
@@ -1308,7 +1335,7 @@ function randomFloorCells(rng) {
   return FLOOR_MIN_CELLS + 2 * Math.floor(rng() * steps);
 }
 
-function isSafeFloorNum(n) { return (n - 1) % SAFE_EVERY === 0; }
+function isSafeFloorNum(n) { return n % SAFE_EVERY === 0; }
 
 // Go to floor n. via: "down" (arrive at its stairs up), "up" (arrive at its
 // stairs down) or "checkpoint" (arrive in its safe room). Floors are made the
@@ -1318,7 +1345,9 @@ function enterFloor(game, n, via) {
   let room = game.floors.get(n);
   if (!room) {
     const cells = game.floorCells || randomFloorCells(game.rng);
-    room = isSafeFloorNum(n) ? makeSafeFloor(cells, n > 1) : makePlainFloor(game, cells);
+    room = n === 0 ? makeFloorZero()
+      : isSafeFloorNum(n) ? makeSafeFloor(cells, true)
+      : makePlainFloor(game, cells);
     game.floors.set(n, room);
   }
   game.area = "maze";
@@ -1329,14 +1358,15 @@ function enterFloor(game, n, via) {
   const at = via === "down" ? room.upStairs.spawn : via === "up" ? room.exit.spawn : room.spawn;
   game.player.x = at.x - PLAYER_SIZE / 2;
   game.player.y = at.y - PLAYER_SIZE / 2;
-  game.stairsLock = true;
+  const under = playerTileUnderCenter(game);
+  game.stairsLock = under === STAIRS_DOWN || under === STAIRS_UP; // arrived on stairs: step off first
   game.effects = [];
   game.npcTalking = false;
   game.flow = null;
   game.skeletons = [];
   for (const r of room.rooms) for (const sp of r.spawns) game.skeletons.push(skeletonFromSpawn(game, sp, r));
   game.deepestFloor = Math.max(game.deepestFloor, n);
-  if (room.safe) game.checkpointFloor = Math.max(game.checkpointFloor, n);
+  if (room.safe && n >= game.checkpointFloor) game.checkpointFloor = n;
   growMaze(game);
   computeVisibility(game);
 }

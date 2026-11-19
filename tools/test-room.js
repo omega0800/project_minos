@@ -23,6 +23,8 @@ function loadGame() {
 }
 
 const G = loadGame();
+// Most maze tests want a safe-room floor with maze around it: floor 3 (31x31).
+const SAFE3 = { startFloor: 3, floorCells: 31 };
 let failures = 0;
 function check(name, cond, detail) {
   if (cond) console.log("  ok   " + name);
@@ -374,13 +376,36 @@ console.log("Long fight simulation");
   check("the bot kills skeletons (" + kills + " kills, " + deaths + " deaths in 5 runs)", kills > 0);
 }
 
-console.log("Floor 1 and the safe room");
+console.log("Floor 0");
 {
   const g = G.makeGame(1);
   const r = g.room;
+  check("every game starts on floor 0, in the safe room", g.floorNum === 0 && G.inSafeRoom(g) && g.checkpointFloor === 0);
+  check("floor 0 has the Old Man and the healing nook", !!r.npc && G.tileAt(r, r.healTile.tx, r.healTile.ty) === G.HEAL);
+  check("floor 0 has no skeletons and nothing to generate", g.skeletons.length === 0 && r.frontier.length === 0);
+  const built = r.builtCount;
+  // Walk out the door and follow the hallway to the stairs.
+  g.player.x = r.door.tx * G.TILE + 5;
+  run(g, hold({ down: true }), 3);
+  check("floor 0 doesn't grow", r.builtCount === built && r.frontier.length === 0);
+  for (let i = 0; i < Math.round(4 / G.STEP) && g.floorNum === 0; i++) G.stepGame(g, hold({ right: true }), G.STEP);
+  check("the hallway from the door leads to the stairs down", g.floorNum === 1);
+  check("floor 1 is the first real floor: a plain maze with no safe room", !g.room.safeRect && g.room.buildable > 0);
+  check("the checkpoint stays floor 0", g.checkpointFloor === 0);
+  run(g, hold({ left: true }), 0.4);
+  const n0 = g.floorNum;
+  for (let i = 0; i < 60 && g.floorNum === 1; i++) G.stepGame(g, hold({ down: true }), G.STEP);
+  for (let i = 0; i < 60 && g.floorNum === 1; i++) G.stepGame(g, hold({ up: true }), G.STEP);
+  check("stairs up from floor 1 lead back to floor 0", n0 === 1 && g.floorNum === 0 && g.room === r);
+}
+
+console.log("A safe-room floor (floor 3)");
+{
+  const g = G.makeGame(1, SAFE3);
+  const r = g.room;
   const T = G.TILE;
   const place = (tx, ty) => { g.player.x = tx * T + 5; g.player.y = ty * T + 5; };
-  check("game starts on floor 1, inside the safe room", g.area === "maze" && g.floorNum === 1 && G.inSafeRoom(g));
+  check("starting on floor 3 puts you in its safe room", g.area === "maze" && g.floorNum === 3 && G.inSafeRoom(g));
   check("floor is much bigger than the screen", r.w * T > G.VIEW_W * 2 && r.h * T > G.VIEW_H * 2);
   check("no skeletons in sight at the start", g.skeletons.every((sk) => !sk.aggro));
   check("player starts on open floor", !G.boxHitsWall(r, g.player.x, g.player.y, g.player.size));
@@ -406,13 +431,14 @@ console.log("Floor 1 and the safe room");
   let inp = none;
   for (let i = 0; i < 20000; i++) {
     if (i % 30 === 0) inp = { up: rnd() < 0.5, down: rnd() < 0.5, left: rnd() < 0.5, right: rnd() < 0.5 };
+    g.stairsLock = true;   // stay on this floor
     G.stepGame(g, inp, G.STEP);
     if (G.boxHitsWall(r, g.player.x, g.player.y, g.player.size)) { bad = true; break; }
   }
   check("20,000 random steps: never inside a wall, the void or the Old Man", !bad);
 
   // Walk out of the door and down the corridor.
-  const out = G.makeGame(1);
+  const out = G.makeGame(1, SAFE3);
   out.player.x = out.room.door.tx * T + 5;            // line up with the doorway
   run(out, hold({ down: true }), 4);
   check("can walk out through the doorway into the corridor", !G.inSafeRoom(out) && out.player.y > out.room.door.ty * T + T);
@@ -430,25 +456,25 @@ console.log("Floor 1 and the safe room");
   check("camera stops at the map's bottom-right edge", c1.x === r.w * T - G.VIEW_W && c1.y === r.h * T - G.VIEW_H);
 
   // Healing nook
-  const h = G.makeGame(1);
+  const h = G.makeGame(1, SAFE3);
   h.player.hp = 1;
   h.player.x = h.room.healTile.tx * T + 5; h.player.y = h.room.healTile.ty * T + 5;
   run(h, none, G.HEAL_INTERVAL * 2 + 0.05);
   check("standing on green heals 1 HP per interval", h.player.hp === 3, "hp=" + h.player.hp);
   run(h, none, 10);
   check("healing stops at max HP", h.player.hp === G.PLAYER_MAX_HP);
-  const off = G.makeGame(1);
+  const off = G.makeGame(1, SAFE3);
   off.player.hp = 2;
   run(off, none, 3);
   check("no healing off the green", off.player.hp === 2);
-  const walk = G.makeGame(1);
+  const walk = G.makeGame(1, SAFE3);
   run(walk, hold({ up: true }), 4);
   const wc = { x: walk.player.x + 11, y: walk.player.y + 11 };
   check("can walk from the start straight up into the nook",
     G.tileAt(walk.room, Math.floor(wc.x / T), Math.floor(wc.y / T)) === G.HEAL);
 
   // The Old Man
-  const n = G.makeGame(1);
+  const n = G.makeGame(1, SAFE3);
   const npc = n.room.npc;
   const nearIt = () => { n.player.x = (npc.tx - 1) * T + 2; n.player.y = npc.ty * T + 5; G.stepGame(n, none, G.STEP); };
   const awayIt = () => { n.player.x = (npc.tx - 8) * T; n.player.y = (npc.ty + 4) * T; G.stepGame(n, none, G.STEP); };
@@ -460,13 +486,13 @@ console.log("Floor 1 and the safe room");
   check("walking up again gives the next line", n.npcLine === 1);
 
   // Arena hop keeps HP
-  const t = G.makeGame(1);
+  const t = G.makeGame(1, SAFE3);
   t.player.hp = 3;
   G.switchArea(t);
   check("T: arena has skeletons and keeps your HP", t.area === "arena" && t.skeletons.length === G.WAVE_SIZE && t.player.hp === 3);
   G.switchArea(t);
-  check("T again: back on floor 1 in the safe room, still 3 HP", t.area === "maze" && G.inSafeRoom(t) && t.player.hp === 3);
-  const t2 = G.makeGame(4);
+  check("T again: back in the checkpoint safe room, still 3 HP", t.area === "maze" && G.inSafeRoom(t) && t.player.hp === 3);
+  const t2 = G.makeGame(4, SAFE3);
   run(t2, hold({ down: true }), 3);
   const floor = t2.room, built = floor.builtCount;
   G.switchArea(t2); G.switchArea(t2);
@@ -477,7 +503,7 @@ console.log("Maze generation");
 {
   // Explore a whole floor by hopping to the frontier (fast; checks the maze's shape).
   function exploreAll(seed) {
-    const g = G.makeGame(seed);
+    const g = G.makeGame(seed, SAFE3);
     const r = g.room;
     for (let guard = 0; guard < 5000 && r.frontier.length; guard++) {
       const f = r.frontier[0].from;
@@ -567,7 +593,7 @@ console.log("Maze generation");
 console.log("Rooms");
 {
   function exploreAll(seed, opts) {
-    const g = G.makeGame(seed, opts);
+    const g = G.makeGame(seed, Object.assign({ startFloor: 1, floorCells: 31 }, opts));
     const r = g.room;
     for (let guard = 0; guard < 5000 && r.frontier.length; guard++) {
       const f = r.frontier[0].from;
@@ -665,7 +691,7 @@ console.log("Skeletons in the maze");
   // Idle skeletons stay in their room.
   // Explore until a room with skeletons is within their active range of the
   // safe room (idle skeletons far from you don't move at all).
-  const g = G.makeGame(3);
+  const g = G.makeGame(3, SAFE3);
   const spawn = g.room.spawn;
   const nearRoom = () => g.room.rooms.some((rm) => rm.spawns.length &&
     Math.hypot((rm.rect.x0 + rm.rect.x1) / 2 * G.TILE - spawn.x, (rm.rect.y0 + rm.rect.y1) / 2 * G.TILE - spawn.y) < 18 * G.TILE);
@@ -690,9 +716,9 @@ console.log("Skeletons in the maze");
   // A fighting bot explores with skeletons around: nobody ends up in walls,
   // skeletons never get into the safe room, and dying brings you back.
   let wallBad = false, safeBad = false, deaths = 0, kills = 0, respawnOk = true, simT = 0;
-  const floorsVisited = new Set([1]);
+  const floorsVisited = new Set([3]);
   for (const seed of [1, 2, 3]) {
-    const f = G.makeGame(seed, { floorCells: 15 });
+    const f = G.makeGame(seed, { startFloor: 3, floorCells: 15 });
     let r = f.room;
     const W = r.cellsW;
     const leaveSafeRoom = () => { if (r.door) { f.player.x = r.door.tx * G.TILE + 5; f.player.y = (r.door.ty + 2) * G.TILE; } };
@@ -780,7 +806,7 @@ console.log("Stairs and floors");
   function countTiles(r, t) { let n = 0; for (let i = 0; i < r.w * r.h; i++) if (r.tiles[i] === t) n++; return n; }
   function stepOn(g, tiles) {
     const [tx, ty] = tiles[0];
-    g.player.x = (tx + 1) * G.TILE - 11; g.player.y = ty * G.TILE + 5;
+    g.player.x = (tx + 0.5) * G.TILE - 11; g.player.y = (ty + 0.5) * G.TILE - 11;
     G.stepGame(g, none, G.STEP);
   }
 
@@ -788,7 +814,7 @@ console.log("Stairs and floors");
   let oneExit = true, sizesOk = true;
   const fracs = [];
   for (const seed of [1, 2, 3, 4, 5, 6, 7, 8]) {
-    const g = G.makeGame(seed, { enemies: false });
+    const g = G.makeGame(seed, { startFloor: 1, enemies: false });
     exploreFloor(g);
     const r = g.room;
     if (countTiles(r, G.STAIRS_DOWN) !== 2 || !r.exit) oneExit = false;
@@ -801,7 +827,7 @@ console.log("Stairs and floors");
   check("floor sizes are odd, " + G.FLOOR_MIN_CELLS + "-" + G.FLOOR_MAX_CELLS + " cells", sizesOk);
 
   // Down to floor 2 and back up.
-  const g = G.makeGame(3, { enemies: false });
+  const g = G.makeGame(3, { startFloor: 1, enemies: false });
   exploreFloor(g);
   const f1 = g.room;
   stepOn(g, f1.exit.tiles);
@@ -833,26 +859,26 @@ console.log("Stairs and floors");
   check("plain floor: fully built, walled in, one stairs up and one stairs down",
     f2.builtCount === f2.buildable && sealed && countTiles(f2, G.STAIRS_UP) === 2 && countTiles(f2, G.STAIRS_DOWN) === 2);
 
-  // Down to floor 4: a safe-room floor, which becomes the checkpoint.
-  for (let n = 2; n < 4; n++) { exploreFloor(g); stepOn(g, g.room.exit.tiles); }
-  check("floor 4 has a safe room with the stairs up inside it", g.floorNum === 4 && g.room.safeRect && G.inSafeRoom(g) &&
+  // Down to floor 3: a safe-room floor, which becomes the checkpoint.
+  exploreFloor(g); stepOn(g, g.room.exit.tiles);
+  check("floor 3 has a safe room with the stairs up inside it", g.floorNum === 3 && g.room.safeRect && G.inSafeRoom(g) &&
     countTiles(g.room, G.STAIRS_UP) === 2);
-  check("reaching floor 4 makes it the checkpoint", g.checkpointFloor === 4);
-  check("floor 4 has the Old Man and the healing nook", !!g.room.npc && countTiles(g.room, G.HEAL) > 0);
+  check("reaching floor 3 makes it the checkpoint", g.checkpointFloor === 3);
+  check("floor 3 has the Old Man and the healing nook", !!g.room.npc && countTiles(g.room, G.HEAL) > 0);
   exploreFloor(g); stepOn(g, g.room.exit.tiles);
   g.player.hp = 0; g.over = true;
   G.respawnAtCheckpoint(g);
-  check("dying on floor 5 sends you to the floor 4 safe room, full HP", g.floorNum === 4 && G.inSafeRoom(g) && g.player.hp === G.PLAYER_MAX_HP);
-  check("deepest floor reached is remembered (for the Old Man)", g.deepestFloor === 5);
+  check("dying on floor 4 sends you to the floor 3 safe room, full HP", g.floorNum === 3 && G.inSafeRoom(g) && g.player.hp === G.PLAYER_MAX_HP);
+  check("deepest floor reached is remembered (for the Old Man)", g.deepestFloor === 4);
 
   const early = G.makeGame(9, { enemies: false });
-  exploreFloor(early); stepOn(early, early.room.exit.tiles);
+  stepOn(early, early.room.exit.tiles);
   early.over = true; G.respawnAtCheckpoint(early);
-  check("dying on floor 2 sends you back to floor 1", early.floorNum === 1 && G.inSafeRoom(early));
+  check("dying on floor 1 sends you back to floor 0", early.deepestFloor === 1 && early.floorNum === 0 && G.inSafeRoom(early));
 
   // Skeletons get harder deeper down.
   const deep = G.makeGame(2);
-  for (let n = 1; n < 10; n++) { exploreFloor(deep); stepOn(deep, deep.room.exit.tiles); }
+  for (let n = 0; n < 10; n++) { exploreFloor(deep); stepOn(deep, deep.room.exit.tiles); }
   exploreFloor(deep);
   const avg = (r) => { const a = r.rooms.flatMap((rm) => rm.spawns.map((sp) => sp.difficulty)); return a.reduce((x, y) => x + y, 0) / a.length; };
   check("floor 10 skeletons are harder than floor 1's", avg(deep.room) > avg(deep.floors.get(1)) + 0.3,
@@ -863,7 +889,7 @@ console.log("Walking the maze (never see it being built)");
 {
   // A bot that really walks: heads for the nearest frontier through open cells.
   // Small 15x15 floor so the test stays quick; full-size timing is a tuning job.
-  const g = G.makeGame(11, { floorCells: 15, enemies: false }), r = g.room, W = r.cellsW, T = G.TILE;
+  const g = G.makeGame(11, { startFloor: 3, floorCells: 15, enemies: false }), r = g.room, W = r.cellsW, T = G.TILE;
   const typeAt = new Int8Array(r.w * r.h).fill(-1); // tile type when last seen
   let sawVoid = 0, popped = 0, steps = 0;
   const cellOf = () => { const c = { x: g.player.x + 11, y: g.player.y + 11 }; return { cx: Math.floor(c.x / (3 * T)), cy: Math.floor(c.y / (3 * T)) }; };
