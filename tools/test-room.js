@@ -16,7 +16,7 @@ function loadGame() {
   vm.runInContext(
     m[1] + "\n;this.__api = { TILE, ROOM_W, ROOM_H, STEP, PLAYER_SPEED, WALL, FLOOR, makeGame, stepGame, tileAt, boxHitsWall," +
       " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER, FACING_LOCK_EXTRA, CHAIN_GRACE," +
-      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED, makeFirstFloor, switchArea, HEAL, DOOR, NPC, VOID, HEAL_INTERVAL, NPC_TALK_RANGE, NPC_LINES, cameraFor, inSafeRoom, VIEW_W, VIEW_H, CELL, isWalkable, CELL_EMPTY, CELL_BUILT, CELL_RESERVED, EDGE_OPEN, EDGE_UNDECIDED, DIRS, neighbour, getEdge, cellCentre, TORCH_RADIUS, GEN_RADIUS, respawnAtCheckpoint, floorDifficulty, exitChance, enterFloor, STAIRS_DOWN, STAIRS_UP, EXIT_K, SAFE_EVERY, FLOOR_MIN_CELLS, FLOOR_MAX_CELLS, toggleMap, drawMap, mapLayout, hurtPlayer, inSafeArea, FLOORS_TO_HARD, SKEL_GIVE_UP, setTile, WALL };",
+      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED, makeFirstFloor, switchArea, HEAL, DOOR, NPC, VOID, HEAL_INTERVAL, NPC_TALK_RANGE, NPC_LINES, cameraFor, inSafeRoom, VIEW_W, VIEW_H, CELL, isWalkable, CELL_EMPTY, CELL_BUILT, CELL_RESERVED, EDGE_OPEN, EDGE_UNDECIDED, DIRS, neighbour, getEdge, cellCentre, TORCH_RADIUS, GEN_RADIUS, respawnAtCheckpoint, floorDifficulty, exitChance, enterFloor, STAIRS_DOWN, STAIRS_UP, EXIT_K, SAFE_EVERY, FLOOR_MIN_CELLS, FLOOR_MAX_CELLS, toggleMap, drawMap, mapLayout, hurtPlayer, serializeGame, gameFromSave, SAVE_VERSION, inSafeArea, FLOORS_TO_HARD, SKEL_GIVE_UP, setTile, WALL };",
     ctx
   );
   return ctx.__api;
@@ -923,6 +923,74 @@ console.log("Map");
   const big = G.makeGame(1, { startFloor: 1, floorCells: G.FLOOR_MAX_CELLS });
   const L = G.mapLayout(big.room);
   check("the biggest floor's map (" + G.FLOOR_MAX_CELLS + "x" + G.FLOOR_MAX_CELLS + ") fits on screen", L.ox >= 0 && L.oy >= 0 && L.ox + big.room.w * L.scale <= G.VIEW_W && L.oy + big.room.h * L.scale <= G.VIEW_H);
+}
+
+console.log("Save and load");
+{
+  function hop(g, maxHops) {
+    const r = g.room;
+    for (let k = 0; k < maxHops && r.frontier.length; k++) {
+      const f = r.frontier[0].from, c = G.cellCentre(f.cx, f.cy);
+      g.player.x = c.x - 11; g.player.y = c.y - 11; g.stairsLock = true;
+      G.stepGame(g, none, G.STEP);
+      g.player.hp = G.PLAYER_MAX_HP; g.player.iframes = 1;
+    }
+  }
+  function onExit(g) { const [tx, ty] = g.room.exit.tiles[0]; g.player.x = (tx + 0.5) * G.TILE - 11; g.player.y = (ty + 0.5) * G.TILE - 11; G.stepGame(g, none, G.STEP); }
+  // Play: floor 0 -> 1 (full) -> 2 (full) -> 3 (safe, checkpoint) -> 4 (half explored).
+  const g = G.makeGame(5, { enemies: true });
+  onExit(g);
+  for (let n = 1; n <= 3; n++) { hop(g, 20000); onExit(g); }
+  hop(g, 120);                                   // floor 4: half explored
+  const before = g.floors.get(4);
+  const text = G.serializeGame(g);
+  const loaded = G.gameFromSave(text, 77);
+  check("a save loads", !!loaded);
+  check("all 5 floors come back", loaded && [0, 1, 2, 3, 4].every((n) => loaded.floors.has(n)));
+  const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+  let identical = true;
+  for (const [n, room] of g.floors) {
+    const r2 = loaded.floors.get(n);
+    // (Loading puts you in the checkpoint's safe room, which can reveal a few new
+    // tiles through its doorway, so there "seen" may only grow.)
+    const seenOk = n === loaded.checkpointFloor ? room.seen.every((v, i) => !v || r2.seen[i]) : same(room.seen, r2.seen);
+    if (!same(room.tiles, r2.tiles) || !seenOk) identical = false;
+    if (room.cells && (!same(room.cells, r2.cells) || !same(room.claimed, r2.claimed) ||
+        !same(room.edgeH, r2.edgeH) || !same(room.edgeV, r2.edgeV))) identical = false;
+    if (JSON.stringify(room.frontier) !== JSON.stringify(r2.frontier) || JSON.stringify(room.rooms) !== JSON.stringify(r2.rooms) ||
+        JSON.stringify(room.exit) !== JSON.stringify(r2.exit) || room.builtCount !== r2.builtCount) identical = false;
+  }
+  check("every floor is identical after loading (layout, what you've seen, half-built edges, rooms, stairs)", identical);
+  check("you resume in the checkpoint's safe room (floor 3), full health",
+    loaded.floorNum === 3 && G.inSafeRoom(loaded) && loaded.player.hp === G.PLAYER_MAX_HP);
+  check("checkpoint and deepest floor are remembered", loaded.checkpointFloor === 3 && loaded.deepestFloor === 4);
+  const spawns = loaded.room.rooms.reduce((n, rm) => n + rm.spawns.length, 0);
+  check("every skeleton on the floor is back", loaded.skeletons.length === spawns);
+
+  // The half-explored floor 4 keeps generating correctly after loading.
+  onExit(loaded);
+  const f4 = loaded.room;
+  check("the stairs down from floor 3 lead to the saved floor 4", loaded.floorNum === 4 && f4.builtCount === before.builtCount);
+  hop(loaded, 20000);
+  let sealed = true;
+  for (let y = 0; y < f4.h; y++) for (let x = 0; x < f4.w; x++) {
+    if (!G.isWalkable(G.tileAt(f4, x, y))) continue;
+    for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]]) if (G.tileAt(f4, x + dx, y + dy) === G.VOID) sealed = false;
+  }
+  let downs = 0; for (let i = 0; i < f4.w * f4.h; i++) if (f4.tiles[i] === G.STAIRS_DOWN) downs++;
+  check("...and finishes as a complete, walled-in floor with one exit", f4.builtCount === f4.buildable && sealed && downs === 2);
+
+  // Size: a fully explored biggest floor.
+  const big = G.makeGame(8, { startFloor: 1, floorCells: G.FLOOR_MAX_CELLS });
+  hop(big, 20000);
+  big.room.seen.fill(1);
+  const one = JSON.parse(G.serializeGame(big)).floors["1"];
+  const kb = JSON.stringify(one).length / 1024;
+  console.log("        (a fully explored " + G.FLOOR_MAX_CELLS + "x" + G.FLOOR_MAX_CELLS + " floor saves as " + kb.toFixed(1) + " KB)");
+  check("a fully explored biggest floor saves in under 40 KB", kb < 40);
+
+  check("a broken save is refused (not a crash)", G.gameFromSave("{not json", 1) === null);
+  check("a save from another version is refused", G.gameFromSave(JSON.stringify({ v: G.SAVE_VERSION + 1, floors: {} }), 1) === null);
 }
 
 console.log("Walking the maze (never see it being built)");

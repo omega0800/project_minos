@@ -1382,6 +1382,105 @@ function respawnAtCheckpoint(game) {
   game.player.hp = PLAYER_MAX_HP;
 }
 
+// ============================================================
+// Saving and loading
+// ============================================================
+// Everything about every floor you've visited is saved (layout, what you've
+// seen, the half-built maze edges, rooms, stairs). Loading always puts you in
+// your checkpoint's safe room at full health with every skeleton respawned.
+const SAVE_VERSION = 1;
+const SAVE_KEY = "projectMinos.save";
+const AUTOSAVE_EVERY = 5;   // seconds
+
+// Short messages at the bottom of the screen.
+function showToast(game, text, seconds) { game.toast = { text, t: seconds }; }
+
+const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+function bytesToB64(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const a = bytes[i], b = i + 1 < bytes.length ? bytes[i + 1] : 0, c = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    const n = (a << 16) | (b << 8) | c;
+    out += B64[(n >> 18) & 63] + B64[(n >> 12) & 63] +
+      (i + 1 < bytes.length ? B64[(n >> 6) & 63] : "=") + (i + 2 < bytes.length ? B64[n & 63] : "=");
+  }
+  return out;
+}
+function b64ToBytes(str) {
+  const len = (str.length / 4) * 3 - (str.endsWith("==") ? 2 : str.endsWith("=") ? 1 : 0);
+  const out = new Uint8Array(len);
+  for (let i = 0, j = 0; i < str.length; i += 4) {
+    const n = (B64.indexOf(str[i]) << 18) | (B64.indexOf(str[i + 1]) << 12) |
+      ((B64.indexOf(str[i + 2]) & 63) << 6) | (B64.indexOf(str[i + 3]) & 63);
+    if (j < len) out[j++] = (n >> 16) & 255;
+    if (j < len) out[j++] = (n >> 8) & 255;
+    if (j < len) out[j++] = n & 255;
+  }
+  return out;
+}
+// 0/1 arrays (what you've seen) are packed 8 to a byte.
+function packBits(arr) {
+  const out = new Uint8Array(Math.ceil(arr.length / 8));
+  for (let i = 0; i < arr.length; i++) if (arr[i]) out[i >> 3] |= 1 << (i & 7);
+  return out;
+}
+function unpackBits(bytes, n) {
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i++) out[i] = (bytes[i >> 3] >> (i & 7)) & 1;
+  return out;
+}
+
+const NOT_SAVED = new Set(["visible", "visList"]);   // rebuilt every frame
+
+function serializeFloor(room) {
+  const out = {};
+  for (const [k, v] of Object.entries(room)) {
+    if (NOT_SAVED.has(k)) continue;
+    if (k === "seen") out[k] = { $bits: bytesToB64(packBits(v)), n: v.length };
+    else if (v instanceof Uint8Array) out[k] = { $u8: bytesToB64(v) };
+    else if (v instanceof Int8Array) out[k] = { $i8: bytesToB64(new Uint8Array(v.buffer, v.byteOffset, v.length)) };
+    else out[k] = v;
+  }
+  return out;
+}
+
+function deserializeFloor(obj) {
+  const room = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v && typeof v === "object" && "$bits" in v) room[k] = unpackBits(b64ToBytes(v.$bits), v.n);
+    else if (v && typeof v === "object" && "$u8" in v) room[k] = b64ToBytes(v.$u8);
+    else if (v && typeof v === "object" && "$i8" in v) { const b = b64ToBytes(v.$i8); room[k] = new Int8Array(b.buffer, 0, b.length); }
+    else room[k] = v;
+  }
+  if (room.seen) { room.visible = new Uint8Array(room.w * room.h); room.visList = []; }
+  return room;
+}
+
+function serializeGame(game) {
+  const floors = {};
+  for (const [n, room] of game.floors) floors[n] = serializeFloor(room);
+  return JSON.stringify({
+    v: SAVE_VERSION, savedAt: Date.now(),
+    checkpointFloor: game.checkpointFloor, deepestFloor: game.deepestFloor, kills: game.kills,
+    floors,
+  });
+}
+
+// Returns a game resumed from a save, or null if the save can't be used.
+function gameFromSave(text, seed) {
+  let data;
+  try { data = JSON.parse(text); } catch (e) { return null; }
+  if (!data || data.v !== SAVE_VERSION || !data.floors) return null;
+  const game = makeGame(seed);
+  game.floors = new Map();
+  for (const [n, f] of Object.entries(data.floors)) game.floors.set(Number(n), deserializeFloor(f));
+  game.checkpointFloor = data.checkpointFloor || 0;
+  game.deepestFloor = data.deepestFloor || 0;
+  game.kills = data.kills || 0;
+  respawnAtCheckpoint(game);
+  return game;
+}
+
 // Walking onto stairs takes you down or up. You arrive standing on the other
 // end's stairs; they don't take you anywhere until you step off and back on.
 function checkStairs(game) {
@@ -1861,8 +1960,18 @@ function drawHud(ctx, game) {
   ctx.font = "12px monospace";
   const hint = game.area === "arena"
     ? "Test arena  |  Skeleton difficulty " + game.difficulty.toFixed(2) + " (keys 1-5)  |  T: back to the maze"
-    : "M: map  \u00b7  T: skeleton test arena";
+    : "M: map  \u00b7  T: skeleton test arena  \u00b7  saves automatically";
   if (!game.mapOpen) ctx.fillText(hint, VIEW_W / 2, VIEW_H - 10);
+  if (game.toast) {
+    ctx.globalAlpha = Math.min(1, game.toast.t / 0.5);
+    ctx.font = "14px monospace";
+    const w = ctx.measureText(game.toast.text).width + 24;
+    ctx.fillStyle = "rgba(20, 16, 28, 0.9)";
+    ctx.fillRect(VIEW_W / 2 - w / 2, VIEW_H - 70, w, 26);
+    ctx.fillStyle = "#ece4f6";
+    ctx.fillText(game.toast.text, VIEW_W / 2, VIEW_H - 52);
+    ctx.globalAlpha = 1;
+  }
 
   if (game.over) {
     ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
@@ -1904,7 +2013,29 @@ function draw(ctx, game, time) {
 if (typeof window !== "undefined" && typeof document !== "undefined" && document.getElementById) {
   const canvas = document.getElementById("game");
   const ctx = canvas.getContext("2d");
-  let game = makeGame((Math.random() * 1e9) | 0);
+  // ---- Saving: this browser's local storage (can be missing or full; never fatal) ----
+  const storage = {
+    load() { try { return window.localStorage.getItem(SAVE_KEY); } catch (e) { return null; } },
+    save(text) { try { window.localStorage.setItem(SAVE_KEY, text); return true; } catch (e) { return false; } },
+    clear() { try { window.localStorage.removeItem(SAVE_KEY); } catch (e) {} },
+  };
+  const newSeed = () => (Math.random() * 1e9) | 0;
+  let game = null;
+  const saved = storage.load();
+  if (saved) {
+    game = gameFromSave(saved, newSeed());
+    if (game) showToast(game, "Welcome back. Resuming at your checkpoint: floor " + game.checkpointFloor + ".   (Shift+N twice: new game)", 6);
+  }
+  if (!game) {
+    game = makeGame(newSeed());
+    if (saved) showToast(game, "Your old save couldn't be loaded, so this is a new game.", 6);
+  }
+  let saveTimer = 0, lastFloor = game.floorNum, wasOver = false, newGameArmed = 0;
+  function saveNow() {
+    if (!storage.save(serializeGame(game))) showToast(game, "Couldn't save (browser storage unavailable or full).", 4);
+  }
+  window.addEventListener("pagehide", saveNow);
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") saveNow(); });
   const input = { up: false, down: false, left: false, right: false, attack: false };
   let attackPressed = false; // set by keydown, consumed by the next simulation step
   window.__minos = { game: () => game, cellCentre, stepGame, STEP }; // debugging / screenshot scripts
@@ -1919,6 +2050,20 @@ if (typeof window !== "undefined" && typeof document !== "undefined" && document
     if (e.code === "Space") {
       if (!e.repeat) attackPressed = true; // one swing per press; holding doesn't auto-swing
       e.preventDefault();
+      return;
+    }
+    if (e.code === "KeyN" && e.shiftKey) {
+      // New game: press Shift+N twice within 3 s. Wipes the save.
+      if (newGameArmed > 0) {
+        storage.clear();
+        game = makeGame(newSeed());
+        lastFloor = game.floorNum; wasOver = false; newGameArmed = 0;
+        saveNow();
+        showToast(game, "New game started.", 3);
+      } else {
+        newGameArmed = 3;
+        showToast(game, "Press Shift+N again to start a NEW game (your save will be erased).", 3);
+      }
       return;
     }
     if (e.code === "KeyR" && game.over) {
@@ -1963,6 +2108,16 @@ if (typeof window !== "undefined" && typeof document !== "undefined" && document
       attackPressed = false;
       stepGame(game, input, STEP);
       acc -= STEP;
+      // Autosave: every few seconds, on changing floors, and on dying.
+      saveTimer += STEP;
+      if (newGameArmed > 0) newGameArmed = Math.max(0, newGameArmed - STEP);
+      if (game.toast) { game.toast.t -= STEP; if (game.toast.t <= 0) game.toast = null; }
+      if (game.floorNum !== lastFloor || (game.over && !wasOver) || saveTimer >= AUTOSAVE_EVERY) {
+        saveNow();
+        saveTimer = 0;
+      }
+      lastFloor = game.floorNum;
+      wasOver = game.over;
     }
     draw(ctx, game, now / 1000);
     requestAnimationFrame(frame);
