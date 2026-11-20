@@ -1,5 +1,5 @@
 // Headless tests for Project Minos.
-// Usage: node tools/test-room.js
+// Usage: node tools/test.js
 // Loads the game script out of project-minos.html and runs it without a browser.
 
 "use strict";
@@ -16,7 +16,7 @@ function loadGame() {
   vm.runInContext(
     m[1] + "\n;this.__api = { TILE, ROOM_W, ROOM_H, STEP, PLAYER_SPEED, WALL, FLOOR, makeGame, stepGame, tileAt, boxHitsWall," +
       " SWING_TIME, SWING_COOLDOWN, SWING_MOVE_MULT, SWING_BUFFER, FACING_LOCK_EXTRA, CHAIN_GRACE," +
-      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED, makeFirstFloor, switchArea, HEAL, DOOR, NPC, VOID, HEAL_INTERVAL, NPC_TALK_RANGE, NPC_LINES, cameraFor, inSafeRoom, VIEW_W, VIEW_H, CELL, isWalkable, CELL_EMPTY, CELL_BUILT, CELL_RESERVED, EDGE_OPEN, EDGE_UNDECIDED, DIRS, neighbour, getEdge, cellCentre, TORCH_RADIUS, GEN_RADIUS, respawnAtCheckpoint, floorDifficulty, exitChance, enterFloor, STAIRS_DOWN, STAIRS_UP, EXIT_K, SAFE_EVERY, FLOOR_MIN_CELLS, FLOOR_MAX_CELLS, toggleMap, drawMap, mapLayout, hurtPlayer, serializeGame, gameFromSave, SAVE_VERSION, inSafeArea, FLOORS_TO_HARD, SKEL_GIVE_UP, setTile, WALL };",
+      " PLAYER_MAX_HP, PLAYER_IFRAMES, SKELETON_EASY, SKELETON_HARD, skeletonStats, SWING_ARC, SWING_REACH, WAVE_SIZE, WAVE_DELAY, makeSkeleton, makeRng, setDifficulty, PLAYER_SPEED, makeSafeFloor, switchArea, HEAL, DOOR, NPC, VOID, HEAL_INTERVAL, NPC_TALK_RANGE, NPC_LINES, cameraFor, inSafeRoom, VIEW_W, VIEW_H, CELL, isWalkable, CELL_EMPTY, CELL_BUILT, CELL_RESERVED, EDGE_OPEN, EDGE_UNDECIDED, DIRS, neighbour, getEdge, cellCentre, TORCH_RADIUS, GEN_RADIUS, respawnAtCheckpoint, floorDifficulty, exitChance, enterFloor, STAIRS_DOWN, STAIRS_UP, EXIT_K, SAFE_EVERY, FLOOR_MIN_CELLS, FLOOR_MAX_CELLS, toggleMap, drawMap, mapLayout, hurtPlayer, serializeGame, gameFromSave, SAVE_VERSION, inSafeArea, FLOORS_TO_HARD, SKEL_GIVE_UP, setTile, WALL };",
     ctx
   );
   return ctx.__api;
@@ -988,6 +988,24 @@ console.log("Save and load");
   const kb = JSON.stringify(one).length / 1024;
   console.log("        (a fully explored " + G.FLOOR_MAX_CELLS + "x" + G.FLOOR_MAX_CELLS + " floor saves as " + kb.toFixed(1) + " KB)");
   check("a fully explored biggest floor saves in under 40 KB", kb < 40);
+
+  // Autosave reuses the saved text of floors you're not on. It must always
+  // match a from-scratch save, including after going back to an old floor.
+  const c = G.makeGame(6, { enemies: true });
+  const fresh = (gm) => { const keep = gm.saveCache; gm.saveCache = null; const t = G.serializeGame(gm); gm.saveCache = keep; return JSON.parse(t).floors; };
+  onExit(c); hop(c, 20000); onExit(c); hop(c, 200);       // floor 2, partly explored
+  G.serializeGame(c);                                     // fills the cache (floors 0, 1)
+  // Back up to floor 1 and explore/see more there, then down again.
+  const [ux, uy] = c.room.upStairs.tiles[0];
+  c.player.x = (ux + 0.5) * G.TILE - 11; c.player.y = (uy + 1.5) * G.TILE - 11; G.stepGame(c, none, G.STEP);
+  c.player.y -= G.TILE; G.stepGame(c, none, G.STEP);
+  const f1 = c.floorNum === 1;
+  for (let i = 0; i < 300; i++) G.stepGame(c, hold({ left: i < 150, down: i >= 150 }), G.STEP);
+  const midway = JSON.stringify(JSON.parse(G.serializeGame(c)).floors) === JSON.stringify(fresh(c));
+  onExit(c);
+  const after = JSON.stringify(JSON.parse(G.serializeGame(c)).floors) === JSON.stringify(fresh(c));
+  check("autosave's reused floors always match a from-scratch save (incl. revisiting a floor)", f1 && midway && after,
+    "f1=" + f1 + " midway=" + midway + " after=" + after);
 
   check("a broken save is refused (not a crash)", G.gameFromSave("{not json", 1) === null);
   check("a save from another version is refused", G.gameFromSave(JSON.stringify({ v: G.SAVE_VERSION + 1, floors: {} }), 1) === null);

@@ -23,6 +23,7 @@
 // ============================================================
 // Config
 // ============================================================
+const STEP = 1 / 60;        // fixed simulation step, seconds
 const TILE = 32;            // pixels per tile
 const VIEW_W = 960;         // screen size in pixels
 const VIEW_H = 640;
@@ -38,6 +39,7 @@ const FLOOR_CELLS = 31;     // default floor size in cells when a fixed size is 
 const FLOOR_MIN_CELLS = 31, FLOOR_MAX_CELLS = 39; // each floor is a random odd size in this range (Dan: 30-40; odd so there's a centre cell)
 const SAFE_EVERY = 3;       // floors 0, 3, 6, ... have a safe room (3 while testing)
 const FLOOR0_CELLS = 13;    // floor 0: the safe room and a short hallway to the stairs down
+const SAFE_BLOCK_W = 7, SAFE_BLOCK_H = 6; // the safe room fills this many cells at the floor's centre
 const EXIT_K = 14;          // exit chance curve: X = (e^(k f) - 1) / (e^k - 1), f = fraction of floor built
 
 // Maze generation
@@ -63,7 +65,6 @@ const EXPLORED_DARK = 0.72;       // darkness over places you've seen but can't 
 // Cells are created this far from you: comfortably past the torchlight, so
 // you never see unbuilt space or a wall turning into an opening.
 const GEN_RADIUS = TORCH_RADIUS + 2 * CELL * TILE;
-const STEP = 1 / 60;        // fixed simulation step, seconds
 
 const PLAYER_SIZE = 22;     // player hitbox, pixels (square)
 const PLAYER_SPEED = 180;   // pixels per second
@@ -181,9 +182,10 @@ function makeRng(seed) {
 }
 
 // ============================================================
-// Room
+// Tiles
 // ============================================================
-// A room is a grid of tiles. For now: floor everywhere, walls on the border.
+// The skeleton test arena: one screen of floor with walls on the border.
+// (Maze floors use the same tile grid; see "Maze floors" below.)
 function makeRoom(w, h) {
   const tiles = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
@@ -216,11 +218,9 @@ function makeFloorGrid(cellsW, cellsH) {
   return { w, h, cellsW, cellsH, tiles: new Uint8Array(w * h).fill(VOID) };
 }
 
-function setTileRaw(room, x, y, t) {
+function setTile(room, x, y, t) {
   if (x >= 0 && y >= 0 && x < room.w && y < room.h) room.tiles[y * room.w + x] = t;
 }
-
-const setTile = setTileRaw;
 
 // Make a cell's 2x2 patch walkable.
 function carveCell(room, cx, cy) {
@@ -231,12 +231,7 @@ function carveCell(room, cx, cy) {
 // Open the wall between a cell and its neighbour (dir: "n", "s", "e" or "w").
 // Doorway tiles stay doorways.
 function openEdge(room, cx, cy, dir) {
-  const bx = cx * CELL, by = cy * CELL;
-  const setTile = (r, x, y, t) => { if (tileAt(r, x, y) !== DOOR) setTileRaw(r, x, y, t); };
-  if (dir === "n") { setTile(room, bx + 1, by, FLOOR); setTile(room, bx + 2, by, FLOOR); }
-  if (dir === "s") { setTile(room, bx + 1, by + CELL, FLOOR); setTile(room, bx + 2, by + CELL, FLOOR); }
-  if (dir === "w") { setTile(room, bx, by + 1, FLOOR); setTile(room, bx, by + 2, FLOOR); }
-  if (dir === "e") { setTile(room, bx + CELL, by + 1, FLOOR); setTile(room, bx + CELL, by + 2, FLOOR); }
+  for (const [x, y] of edgeTiles(cx, cy, dir)) if (tileAt(room, x, y) !== DOOR) setTile(room, x, y, FLOOR);
 }
 
 // Every VOID tile touching walkable ground (including diagonally) becomes wall.
@@ -253,12 +248,6 @@ function wallUp(room) {
       if (touches) setTile(room, x, y, WALL);
     }
 }
-
-// Floor 1: the safe room sits in the middle of the floor, filling a block of
-// 7 x 6 cells. It has a healing nook in its top wall, the Old Man, and a
-// 2-wide doorway in its bottom wall that lines up with the cell below it, so
-// the maze can grow from there.
-function makeFirstFloor(cells) { return makeSafeFloor(cells, false); }
 
 // Floor 0, where every game starts: the safe room and one short hand-built
 // hallway from its doorway to the stairs down. Nothing is generated here.
@@ -285,7 +274,10 @@ function makeFloorZero() {
 }
 
 // A floor with the safe room at its centre (floor 0, and every SAFE_EVERY
-// floors after). Below floor 0 the safe room also has the stairs back up.
+// floors after). The safe room fills a SAFE_BLOCK_W x SAFE_BLOCK_H block of
+// cells; it has a healing nook in its top wall, the Old Man, and a 2-wide
+// doorway in its bottom wall that lines up with the cell below it, so the maze
+// can grow from there. Below floor 0 it also has the stairs back up.
 function makeSafeFloor(cells, withUpStairs) {
   const n = cells || FLOOR_CELLS;                        // odd, at least 9
   const room = makeFloorGrid(n, n);
@@ -333,7 +325,7 @@ function makeSafeFloor(cells, withUpStairs) {
     room.upStairs = { tiles: [[ux, uy], [ux + 1, uy]], spawn: { x: (ux + 1) * TILE, y: (uy + 0.5) * TILE } };
   }
   room.safe = true;
-  room.buildable = room.cellsW * room.cellsH - 42;      // everything but the safe room's 7x6 block
+  room.buildable = room.cellsW * room.cellsH - SAFE_BLOCK_W * SAFE_BLOCK_H; // everything but the safe room
   return room;
 }
 
@@ -370,15 +362,15 @@ function exitChance(f) {
   return (Math.exp(EXIT_K * f) - 1) / (Math.exp(EXIT_K) - 1);
 }
 
-function maybePlaceExit(game, block, roomPlan) {
+function maybePlaceExit(game, block, newRoom) {
   const room = game.room;
   if (room.exit || !room.buildable) return;
   const f = Math.min(1, room.builtCount / room.buildable);
   if (f < 1 && game.rng() >= exitChance(f)) return;
   let tx, ty;
-  if (roomPlan) {                     // in a room: the middle of the room
-    tx = Math.floor((roomPlan.rect.x0 + roomPlan.rect.x1) / 2);
-    ty = Math.floor((roomPlan.rect.y0 + roomPlan.rect.y1) / 2);
+  if (newRoom) {                      // in a room: the middle of the room
+    tx = Math.floor((newRoom.rect.x0 + newRoom.rect.x1) / 2);
+    ty = Math.floor((newRoom.rect.y0 + newRoom.rect.y1) / 2);
   } else {                            // in a corridor cell: its top row
     tx = block[0][0] * CELL + 1;
     ty = block[0][1] * CELL + 1;
@@ -395,7 +387,6 @@ const CELL_EMPTY = 0, CELL_BUILT = 1, CELL_RESERVED = 2;
 const EDGE_UNDECIDED = -1, EDGE_WALL = 0, EDGE_OPEN = 1;
 const DIRS = ["n", "e", "s", "w"];
 const DIR_STEP = { n: [0, -1], e: [1, 0], s: [0, 1], w: [-1, 0] };
-const OPPOSITE = { n: "s", e: "w", s: "n", w: "e" };
 
 function initCells(room) {
   const W = room.cellsW, H = room.cellsH;
@@ -487,8 +478,7 @@ function shuffled(arr, rng) {
   return a;
 }
 
-// Mark a cell built and carve it, plus every already-open wall between it and
-// built cells or the safe room (the way in, and any loops waiting on it).
+// Mark a cell built and carve its floor.
 function markBuilt(room, cx, cy) {
   room.claimed[cy * room.cellsW + cx] = 0;
   room.cells[cy * room.cellsW + cx] = CELL_BUILT;
@@ -496,6 +486,8 @@ function markBuilt(room, cx, cy) {
   carveCell(room, cx, cy);
 }
 
+// Carve every already-open wall between a cell and built cells or the safe
+// room: the way in, and any loops that were waiting on it.
 function carveOpenEdges(room, cx, cy) {
   for (const d of DIRS) {
     const n = neighbour(room, cx, cy, d);
@@ -571,10 +563,9 @@ function buildCell(game, entry) {
   for (const [x, y] of block) markBuilt(room, x, y);
   if (block.length > 1) mergeBlock(room, block);
   for (const [x, y] of block) carveOpenEdges(room, x, y);
-  if (roomPlan) addRoom(game, roomPlan);
-  else if (block.length > 1) room.wideHalls.push(block);
-  if (roomPlan) roomPlan.rect = room.rooms[room.rooms.length - 1].rect;
-  maybePlaceExit(game, block, roomPlan);
+  const newRoom = roomPlan ? addRoom(game, roomPlan) : null;
+  if (!roomPlan && block.length > 1) room.wideHalls.push(block);
+  maybePlaceExit(game, block, newRoom);
 
   const openable = [];
   for (const [x, y] of block) {
@@ -597,7 +588,7 @@ function buildCell(game, entry) {
   for (const [x, y] of block) wallUpAround(room, x, y);
 }
 
-// ---------- Blocks of merged cells (wide halls now, rooms later) ----------
+// ---------- Blocks of merged cells (wide halls and rooms) ----------
 // Open every wall between cells of the block and remove the pillars where
 // four block cells meet, so the block is one open space.
 function mergeBlock(room, block) {
@@ -639,7 +630,7 @@ function planRoom(game, entry) {
   return null;
 }
 
-// Record a new room and put its skeletons in it (out of sight).
+// Record a new room and put its skeletons in it (out of sight). Returns the room record.
 function addRoom(game, plan) {
   const room = game.room, rng = game.rng;
   const rect = {   // floor tiles, inclusive
@@ -664,6 +655,7 @@ function addRoom(game, plan) {
   const r = { ...plan, rect, spawns };
   room.rooms.push(r);
   for (const sp of spawns) game.skeletons.push(skeletonFromSpawn(game, sp, r));
+  return r;
 }
 
 // Average skeleton difficulty rises with depth; each skeleton varies a little.
@@ -735,9 +727,7 @@ function forceOpening(game) {
       for (const d of DIRS) {
         const n = neighbour(room, cx, cy, d);
         if (!n || cellState(room, n.cx, n.cy) !== CELL_EMPTY || room.claimed[n.cy * room.cellsW + n.cx]) continue;
-        const bx = cx * CELL, by = cy * CELL;
-        const wx = d === "e" ? bx + CELL : d === "w" ? bx : bx + 1;
-        const wy = d === "s" ? by + CELL : d === "n" ? by : by + 1;
+        const [wx, wy] = edgeTiles(cx, cy, d)[0];
         const i = wy * room.w + wx;
         (room.visible[i] ? shown : room.seen[i] ? hidden : unseen).push({ cx, cy, d, n });
       }
@@ -936,7 +926,7 @@ function makePlayer(room) {
     flash: 0,
     knock: null,
     facing: { x: 0, y: 1 }, // last direction moved; sword swings this way
-    swing: null,            // { t, angle, hit: Set } while swinging, else null
+    swing: null,            // a swing (see newSwing) while swinging, else null
     cooldown: 0,            // time until another swing may start
     facingLock: 0,          // >0 after a swing ends: facing can't turn yet
     buffered: 0,            // >0 while a queued swing press is still fresh
@@ -1062,6 +1052,12 @@ function inSafeArea(room, x, y) {
   return tx >= r.x0 - 1 && tx <= r.x1 + 1 && ty >= r.y0 - 1 && ty <= r.y1 + 1;
 }
 
+// Is a point (a skeleton's centre) comfortably inside its home room?
+function insideHome(sk, x, y) {
+  const h = sk.home, half = sk.size / 2;
+  return !h || (x >= h.x0 + half && x <= h.x1 - half && y >= h.y0 + half && y <= h.y1 - half);
+}
+
 // Move a skeleton, never into the safe room.
 function moveSkeleton(room, sk, dx, dy) {
   const x0 = sk.x, y0 = sk.y;
@@ -1127,7 +1123,7 @@ function updateSkeleton(game, sk, dt) {
   if (!sk.aggro && d > SKEL_ACTIVE_RANGE) return; // far away and idle: nothing to do
   const sc = centerOf(sk), pc = centerOf(p);
   const sees = d <= st.leashRange && losClear(room, sc.x, sc.y, pc.x, pc.y);
-  const playerSafe = room.safeRect ? inSafeArea(room, pc.x, pc.y) : false;
+  const playerSafe = inSafeArea(room, pc.x, pc.y);
   if (!sk.aggro && playerAlive && !playerSafe && d <= st.aggroRange && sees) { sk.aggro = true; sk.lostT = 0; }
   if (sk.aggro) {
     sk.lostT = sees ? 0 : sk.lostT + dt;
@@ -1175,8 +1171,8 @@ function updateSkeleton(game, sk, dt) {
     }
   } else {
     // Outside its room (pushed out, or after a chase)? Walk back home.
-    const h = sk.home, half = sk.size / 2;
-    if (h && !(sc.x >= h.x0 + half && sc.x <= h.x1 - half && sc.y >= h.y0 + half && sc.y <= h.y1 - half)) {
+    const h = sk.home;
+    if (!insideHome(sk, sc.x, sc.y)) {
       const hx = (h.x0 + h.x1) / 2 - sc.x, hy = (h.y0 + h.y1) / 2 - sc.y, hl = Math.hypot(hx, hy) || 1;
       sk.facing = { x: hx / hl, y: hy / hl };
       moveSkeleton(room, sk, sk.facing.x * st.wanderSpeed * dt, sk.facing.y * st.wanderSpeed * dt);
@@ -1196,10 +1192,9 @@ function updateSkeleton(game, sk, dt) {
     }
     if (sk.wanderDir) {
       // Stay in its room: turn back rather than wander out of it.
+      // (It's inside its room here; the walk-home branch above handled outside.)
       const nx = sc.x + sk.wanderDir.x * st.wanderSpeed * dt, ny = sc.y + sk.wanderDir.y * st.wanderSpeed * dt;
-      const insideNow = !h || (sc.x >= h.x0 + half && sc.x <= h.x1 - half && sc.y >= h.y0 + half && sc.y <= h.y1 - half);
-      const insideNext = !h || (nx >= h.x0 + half && nx <= h.x1 - half && ny >= h.y0 + half && ny <= h.y1 - half);
-      if (insideNow && !insideNext) {
+      if (!insideHome(sk, nx, ny)) {
         sk.wanderDir = { x: -sk.wanderDir.x, y: -sk.wanderDir.y };
         sk.facing = sk.wanderDir;
       }
@@ -1285,9 +1280,8 @@ function playerAttacks(game) {
 // ============================================================
 // Game state
 // ============================================================
-// Areas: "maze" (maze floor 1, with the safe room at its centre, where the game
-// starts) and "arena" (the one-screen room with skeleton waves, kept for
-// testing combat until the maze has enemies).
+// Areas: "maze" (the floors; every game starts on floor 0) and "arena" (the
+// one-screen skeleton test room, key T).
 // opts.area: which area to start in (default "maze")
 // opts.skeletons === false: no skeleton waves in the arena (used by movement tests)
 function makeGame(seed, opts) {
@@ -1324,7 +1318,6 @@ function makeGame(seed, opts) {
     difficulty: (opts && opts.difficulty) || 0, // skeleton difficulty for new waves (testing keys 1-5)
   };
   if (game.waves && area === "arena") spawnWave(game, WAVE_SIZE);
-  game.mazeRoom = null;
   if (area === "maze") {
     game.player = null;
     enterFloor(game, startFloor, isSafeFloorNum(startFloor) ? "checkpoint" : "down");
@@ -1343,6 +1336,7 @@ function isSafeFloorNum(n) { return n % SAFE_EVERY === 0; }
 // stairs down) or "checkpoint" (arrive in its safe room). Floors are made the
 // first time you reach them and kept after that; skeletons respawn on arrival.
 function enterFloor(game, n, via) {
+  if (game.saveCache) game.saveCache.delete(game.floorNum); // the floor we're leaving may have changed
   game.floorNum = n;
   let room = game.floors.get(n);
   if (!room) {
@@ -1353,7 +1347,7 @@ function enterFloor(game, n, via) {
     game.floors.set(n, room);
   }
   game.area = "maze";
-  game.room = game.mazeRoom = room;
+  game.room = room;
   const hp = game.player ? game.player.hp : PLAYER_MAX_HP;
   game.player = makePlayer(room);
   game.player.hp = hp;
@@ -1456,14 +1450,26 @@ function deserializeFloor(obj) {
   return room;
 }
 
+// Floors you aren't on don't change, so their saved text is kept and reused;
+// only the current floor is re-serialized each autosave. (enterFloor drops the
+// cached text of the floor you leave.)
 function serializeGame(game) {
-  const floors = {};
-  for (const [n, room] of game.floors) floors[n] = serializeFloor(room);
-  return JSON.stringify({
+  if (!game.saveCache) game.saveCache = new Map();
+  const parts = [];
+  for (const [n, room] of game.floors) {
+    const current = n === game.floorNum;      // the floor you're on is always saved fresh
+    let text = current ? undefined : game.saveCache.get(n);
+    if (text === undefined) {
+      text = JSON.stringify(serializeFloor(room));
+      if (!current) game.saveCache.set(n, text);
+    }
+    parts.push(JSON.stringify(String(n)) + ":" + text);
+  }
+  const head = JSON.stringify({
     v: SAVE_VERSION, savedAt: Date.now(),
     checkpointFloor: game.checkpointFloor, deepestFloor: game.deepestFloor, kills: game.kills,
-    floors,
   });
+  return head.slice(0, -1) + ',"floors":{' + parts.join(",") + "}}";
 }
 
 // Returns a game resumed from a save, or null if the save can't be used.
@@ -1731,7 +1737,8 @@ function wrapText(ctx, text, maxW) {
 function drawSpeech(ctx, game, cam) {
   const room = game.room;
   if (!room.npc || !game.npcTalking || game.npcLine < 0) return;
-  const text = npcLineGroup(game).lines[game.npcLine % npcLineGroup(game).lines.length];
+  const lines0 = npcLineGroup(game).lines;
+  const text = lines0[game.npcLine % lines0.length];
   ctx.font = "14px monospace";
   const lines = wrapText(ctx, text, 260);
   const lh = 18, padX = 10, padY = 8;
@@ -2030,9 +2037,11 @@ if (typeof window !== "undefined" && typeof document !== "undefined" && document
     game = makeGame(newSeed());
     if (saved) showToast(game, "Your old save couldn't be loaded, so this is a new game.", 6);
   }
-  let saveTimer = 0, lastFloor = game.floorNum, wasOver = false, newGameArmed = 0;
+  let saveTimer = 0, lastFloor = game.floorNum, wasOver = false, newGameArmed = 0, saveWarned = false;
   function saveNow() {
-    if (!storage.save(serializeGame(game))) showToast(game, "Couldn't save (browser storage unavailable or full).", 4);
+    if (storage.save(serializeGame(game))) { saveWarned = false; return; }
+    if (!saveWarned) showToast(game, "Couldn't save (browser storage unavailable or full).", 4);
+    saveWarned = true;   // say it once, not every autosave
   }
   window.addEventListener("pagehide", saveNow);
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") saveNow(); });
