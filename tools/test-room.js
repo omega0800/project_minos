@@ -841,11 +841,18 @@ console.log("Stairs and floors");
   check("holding the key you arrived with doesn't bounce you back", g.floorNum === 2);
   // Walk in a direction until the floor changes (or time runs out).
   const walkTo = (dir, t) => { const n0 = g.floorNum; for (let i = 0; i < Math.round(t / G.STEP) && g.floorNum === n0; i++) G.stepGame(g, hold({ [dir]: true }), G.STEP); };
-  run(g, hold({ down: true }), 0.3);      // step off...
+  // Step off onto the tile just below the stairs (always floor: the landing is
+  // 2 tiles deep), then walk back up onto them.
+  const offBelow = (tiles) => {
+    const [tx, ty] = tiles[0];
+    g.player.x = (tx + 0.5) * G.TILE - 11; g.player.y = (ty + 1.5) * G.TILE - 11;
+    G.stepGame(g, none, G.STEP);
+  };
+  offBelow(f2.upStairs.tiles);            // step off...
   walkTo("up", 0.4);                      // ...and back on
   check("walking onto the stairs up takes you back to floor 1", g.floorNum === 1 && g.room === f1);
   check("...arriving on floor 1's stairs down", under() === G.STAIRS_DOWN);
-  run(g, hold({ down: true }), 0.3);
+  offBelow(f1.exit.tiles);
   walkTo("up", 0.4);
   check("and down again lands on the same floor 2 as before", g.floorNum === 2 && g.room === f2);
 
@@ -913,9 +920,9 @@ console.log("Map");
   const seen = g.room.seen.reduce((n, v, i) => n + (v && g.room.tiles[i] !== G.VOID ? 1 : 0), 0);
   const tileRects = calls.length - 1;    // minus the backdrop
   check("map draws one square per tile you've seen (" + seen + "), nothing else", tileRects === seen, tileRects + " squares");
-  const big = G.makeGame(1, { startFloor: 1, floorCells: 31 });
+  const big = G.makeGame(1, { startFloor: 1, floorCells: G.FLOOR_MAX_CELLS });
   const L = G.mapLayout(big.room);
-  check("a 31x31-cell floor's map fits on screen", L.ox >= 0 && L.oy >= 0 && L.ox + big.room.w * L.scale <= G.VIEW_W && L.oy + big.room.h * L.scale <= G.VIEW_H);
+  check("the biggest floor's map (" + G.FLOOR_MAX_CELLS + "x" + G.FLOOR_MAX_CELLS + ") fits on screen", L.ox >= 0 && L.oy >= 0 && L.ox + big.room.w * L.scale <= G.VIEW_W && L.oy + big.room.h * L.scale <= G.VIEW_H);
 }
 
 console.log("Walking the maze (never see it being built)");

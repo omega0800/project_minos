@@ -35,10 +35,10 @@ const ROOM_H = 20;
 // (3cx+1 .. 3cx+2, 3cy+1 .. 3cy+2); walls sit on multiples of 3.
 const CELL = 3;
 const FLOOR_CELLS = 31;     // default floor size in cells when a fixed size is asked for (tests)
-const FLOOR_MIN_CELLS = 19, FLOOR_MAX_CELLS = 25; // each floor is a random odd size in this range (for now)
+const FLOOR_MIN_CELLS = 31, FLOOR_MAX_CELLS = 39; // each floor is a random odd size in this range (Dan: 30-40; odd so there's a centre cell)
 const SAFE_EVERY = 3;       // floors 0, 3, 6, ... have a safe room (3 while testing)
 const FLOOR0_CELLS = 13;    // floor 0: the safe room and a short hallway to the stairs down
-const EXIT_K = 6;           // exit chance curve: X = (e^(k f) - 1) / (e^k - 1), f = fraction of floor built
+const EXIT_K = 14;          // exit chance curve: X = (e^(k f) - 1) / (e^k - 1), f = fraction of floor built
 
 // Maze generation
 const BRANCH_CHANCE = 0.4;  // chance each side of a new cell opens into untouched space (q)
